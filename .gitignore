@@ -205,3 +205,63 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ------------------------------
+# ML / GenAI project extras
+# ------------------------------
+
+# Datasets / downloads (Kaggle etc.)
+data/
+datasets/
+kaggle/
+BRISC2025/
+*.csv
+*.tsv
+*.parquet
+*.jsonl
+*.zip
+*.tar
+*.gz
+*.7z
+
+# Medical imaging formats
+*.dcm
+*.nii
+*.nii.gz
+*.mha
+*.mhd
+*.nrrd
+
+# Model weights / checkpoints / training outputs
+models/
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.pkl
+*.joblib
+
+# Vector DB / retrieval indexes
+indexes/
+index/
+faiss_index/
+chroma_db/
+*.faiss
+*.index
+
+# Logs & local outputs
+logs/
+*.log
+outputs/
+tmp/
+
+# IDEs (optional)
+.vscode/
+.idea/
+
