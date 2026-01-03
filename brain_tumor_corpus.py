@@ -27,6 +27,27 @@ os.makedirs(PDF_DIR, exist_ok=True)
 os.makedirs(HTML_DIR, exist_ok=True)
 os.makedirs(JSONL_DIR, exist_ok=True)
 
+# ---------- CONFIG ----------
+# Base folder of BrainTumorChatbot (where this file lives)
+# BASE_DIR = pathlib.Path(__file__).resolve().parent
+
+# # Where to SAVE processed corpus + FAISS index
+# SAVE_ROOT = os.path.join(BASE_DIR, "corpus")
+
+# # Where your RAW PDFs already live
+# # C:\Fatima_Final_Bot\BrainTumorChatbot\rag_sources
+# PDF_DIR   = os.path.join(BASE_DIR, "rag_sources")
+
+# # Other internal folders for processed data
+# HTML_DIR  = os.path.join(SAVE_ROOT, "html")
+# JSONL_DIR = os.path.join(SAVE_ROOT, "jsonl")
+
+# os.makedirs(SAVE_ROOT, exist_ok=True)
+# os.makedirs(HTML_DIR, exist_ok=True)
+# os.makedirs(JSONL_DIR, exist_ok=True)
+# NOTE: we do NOT create PDF_DIR here because your PDFs already exist there
+
+
 # Where we store the main text corpus JSONL and the FAISS index
 JSONL_PATH = os.path.join(JSONL_DIR, "brain_tumor_corpus.jsonl")
 RAG_DIR    = os.path.join(SAVE_ROOT, "rag_index")
@@ -41,53 +62,26 @@ FORCE_REBUILD = os.getenv("FORCE_REBUILD", "1").lower() not in ("0", "false", ""
 
 # ---------- SOURCE LINKS ---------- TARGET
 LINKS = [
-    
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC8328013/pdf",  # WHO 2021
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9427889/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC8563316/pdf",
+       
     "https://www.nature.com/articles/s41571-020-00447-z",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10158123/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10860967/pdf",
     "https://kjronline.org/pdf/10.3348/kjr.2024.0016",
     "https://www.nccn.org/patients/guidelines/content/PDF/brain-gliomas-patient.pdf",
     "https://bookcafe.yuntsg.com/ueditor/jsp/upload/file/20241017/1729130847445055961.pdf",
     "https://publications.iarc.who.int/Book-And-Report-Series/Who-Classification-Of-Tumours/Central-Nervous-System-Tumours-2021",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC11801446/pdf",
     "https://zenodo.org/records/4575162/files/RSNA-MICCAIBrainTumorSegmentation%28BraTS%29Challenge2021_02-26-2021_08-29-02.pdf?download=1",
     "https://arxiv.org/abs/2107.02314",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10441440/pdf",
     "https://www.cancerimagingarchive.net/collection/tcga-gbm/",
     "https://www.cancerimagingarchive.net/collection/rider-neuro-mri/",
     "https://www.cancerimagingarchive.net/collection/rhuh-gbm/",
-    "https://www.cancer.gov/ccg/research/genome-sequencing/tcga",
-    "https://www.biorxiv.org/content/10.1101/2023.02.19.529134v3.full.pdf",
     "https://www.cureus.com/articles/156034-non-enhancing-glioblastoma-a-case-report.pdf",
     "https://www.cureus.com/articles/309174-atypical-presentation-of-glioblastoma-a-case-report.pdf",
     "https://www.cureus.com/articles/236615-integrating-physiotherapy-for-enhancing-functional-recovery-in-glioblastoma-multiforme-a-case-report.pdf",
     "https://www.cureus.com/articles/178035-intradural-intramedullary-spinal-cord-glioblastoma-a-case-report.pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9379095/pdf",
     "https://www.frontiersin.org/journals/neurology/articles/10.3389/fneur.2022.1086591/pdf",
     "https://www.cureus.com/articles/230625-meningioma-of-the-fourth-ventricle-of-the-brain-a-case-report.pdf",
-    # Etiology/epidemiology set (shortened here for brevity – keep yours)
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC5123811/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC8004084/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC9911713/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC5563115/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10477988/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10571999/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC12185496/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC2945461/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC11596971/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC4995146/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC4257885/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC5790603/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC4110181/pdf",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC10248585/pdf",
-    # General-knowledge Q/A-friendly (shortened – keep yours)
     "https://www.uhcw.nhs.uk/download/clientfiles/files/Patient%20Information%20Leaflets/Trauma%20and%20Neuro%20services/Neurosurgery/Brain%20tumours.pdf",
     "https://www.abta.org/wp-content/uploads/2020/06/About-Brain-Tumors_2020_web_en.pdf",
     "https://www.cancer.org.au/assets/pdf/understanding-brain-tumour-booklet",
-    "https://pmc.ncbi.nlm.nih.gov/articles/PMC3842445/",
     "https://www.nhs.uk/conditions/brain-tumours/",
     "https://www.nhs.uk/conditions/malignant-brain-tumour/",
     "https://medlineplus.gov/braintumors.html",
@@ -95,8 +89,6 @@ LINKS = [
     "https://www.abta.org/wp-content/uploads/2018/03/pituitary-tumors-brochure.pdf",  # ABTA pituitary overview
     "https://www.urmc.rochester.edu/medialibraries/urmcmedia/neurosurgery/specialties/neuroendocrine/documents/pituitarytumors.pdf",  # URMC pituitary
     "https://www.nanosweb.org/files/Patient%20Brochures/English/2021/Pituitary_Tumor.pdf",  # NANOS pituitary
-    "https://www.astro.org/ASTRO/media/ASTRO/AffiliatePages/arro/PDFs/ARROCase_Pituitary.pdf",  # ASTRO pituitary case
-    "https://www.nejm.org/doi/pdf/10.1056/nejmra1810772",  # NEJM pituitary endocrinopathies
     "https://www.btrt.org/Synapse/Data/PDFData/0212BTRT/btrt-11-173.pdf",  # BTRT pituitary classification
     "https://www.ese-hormones.org/media/gpfdoe2i/ese-patient-leaflet_pregnancy_final.pdf",  # ESE pituitary in pregnancy
     "https://www.ccjm.org/content/ccjom/75/11/793.full.pdf",  # CCJM pituitary incidentalomas
@@ -106,53 +98,24 @@ LINKS = [
     "https://www.mayoclinic.org/diseases-conditions/meningioma/symptoms-causes/syc-20355643",
 "https://www.cancer.gov/rare-brain-spine-tumor/tumors/meningioma",
 "https://my.clevelandclinic.org/health/diseases/17858-meningioma",
-"https://pmc.ncbi.nlm.nih.gov/articles/PMC8004084/",
-"https://rarediseases.org/rare-diseases/meningioma/",
-"https://pmc.ncbi.nlm.nih.gov/articles/PMC2945460/",
 "https://nyulangone.org/conditions/meningioma/diagnosis",
 "https://stanfordhealthcare.org/medical-conditions/brain-and-nerves/meningioma-skull-base/about-this-condition/diagnosis.html",
 "https://www.nature.com/articles/s41598-023-41576-6",
 "https://www.ncbi.nlm.nih.gov/books/NBK560538/",
 "https://www.mayoclinic.org/diseases-conditions/meningioma/diagnosis-treatment/drc-20355648",
-"https://www.hopkinsmedicine.org/health/treatment-tests-and-therapies/meningioma-treatment",
 "https://pmc.ncbi.nlm.nih.gov/articles/PMC7473392/",
 "https://njbrainspine.com/surgical-non-surgical-approaches-meningioma-treatment/",
-"https://www.moffitt.org/cancers/meningioma/treatment/radiation-therapy/",
-"https://pmc.ncbi.nlm.nih.gov/articles/PMC9722800/",
-"https://www.redjournal.org/article/S0360-3016%252824%252903525-9/fulltext",
 "https://www.aaroncohen-gadol.com/en/patients/meningioma/treatment/radiation-therapy",
 "https://nyulangone.org/conditions/meningioma/treatments/radiation-therapy-for-meningioma",
-"https://pubmed.ncbi.nlm.nih.gov/37774783/",
-"https://www.sciencedirect.com/science/article/pii/S1878875023013438",
-"https://journals.lww.com/annals-of-medicine-and-surgery/fulltext/2025/08000/evolving_treatment_strategies_in_meningioma__from.55.aspx",
-"https://ar.iiarjournals.org/content/35/12/6391",
 "https://www.barrowneuro.org/condition/meningioma/",
-"https://www.redjournal.org/article/S0360-3016%2525252824%2525252903525-9/pdf",
-"https://pmc.ncbi.nlm.nih.gov/articles/PMC10469847/pdf",
 "https://www.e-roj.org/upload/pdf/roj-2021-00563.pdf",
-"https://ajronline.org/doi/pdf/10.2214/ajr.123.3.453?download=true",
-"https://www.astro.org/ASTRO/media/ASTRO/AffiliatePages/arro/PDFs/ARROCase_MeningiomaAdjuvant.pdf",
-"https://www.redjournal.org/article/S0360-3016%252824%252903525-9/pdf",
-"https://www.advancesradonc.org/article/S2452-1094%2824%2900272-0/pdf",
-"https://www.practicalradonc.org/article/S1879-8500%2824%2900090-0/pdf",
 "https://thejns.org/downloadpdf/journals/j-neurosurg/89/6/article-p933.pdf",
-"https://www.astro.org/getmedia/ff0d6a20-3d88-4713-8710-e24c1efddc11/WHOGrade4Glioma_PC.pdf",
 "https://www.brainlife.org/fulltext/2024/Trkova_K240207_SciRep.pdf",
-"https://www.biorxiv.org/content/10.1101/2025.10.08.681196v1.full.pdf",
-"https://pmc.ncbi.nlm.nih.gov/articles/PMC9617255/pdf",
-"https://www.annalsofoncology.org/article/S0923-7534%2819%2941755-9/pdf",
-"https://pmc.ncbi.nlm.nih.gov/articles/PMC9031600/pdf",
 "https://www.eymj.org/pdf/10.3349/ymj.2022.0323",
-"https://www.astro.org/ASTRO/media/ASTRO/AffiliatePages/arro/PDFs/ARROCase_Pituitary.pdf",
-"https://www.redjournal.org/article/S0360-3016%2807%2904704-9/pdf",
-"https://www.abta.org/wp-content/uploads/2018/03/pituitary-tumors-brochure.pdf",
 "https://www.urmc.rochester.edu/medialibraries/urmcmedia/neurosurgery/specialties/neuroendocrine/documents/pituitarytumors.pdf?fbclid=IwAR0ZY5FlVIKKMaLrqWAXMuZU34gJVui4dl4BIxWwzWYHdtsXt-UeNj_laQI",
 "https://www.msjonline.org/index.php/ijrms/article/download/13326/8620/61272",
-"https://www.astro.org/ASTRO/media/ASTRO/MedulloblastomaAJW.pdf",
-"https://www.redjournal.org/article/S0360-3016%2812%2901220-5/pdf",
 "https://www.turkarchpediatr.org/Content/files/sayilar/128/TAP_May_2023-76-81.pdf",
 "https://pdfs.semanticscholar.org/45f7/35ceafa022da5ba6c9c934bef3ff7de1841c.pdf",
-"https://www.pbtc.org/public/Summaries/PBTC-060/PBTC-060%2520v1%2520Abstract%2C%2520Objectives%2520and%2520Eligibility%2520for%2520Website%2520090121.pdf",
 "https://thejns.org/downloadpdf/view/journals/j-neurosurg-pediatr/23/3/article-p261.pdf",
 "https://www.abta.org/wp-content/uploads/2018/03/about-brain-tumors-a-primer-1.pdf",
 "https://www.ivybraintumorcenter.org/wp-content/uploads/2019/11/BrainTumor_Handbook.pdf",
@@ -160,7 +123,12 @@ LINKS = [
 "https://www.govinfo.gov/content/pkg/GOVPUB-HE20_3150-PURL-LPS118730/pdf/GOVPUB-HE20_3150-PURL-LPS118730.pdf",
 "https://virtualtrials.org/Guide/BrainTumorGuidev12.pdf",
 "https://www.aafp.org/pubs/afp/issues/2016/0201/p211.pdf",
-"https://stachestrong.org/wp-content/uploads/2024/03/Newly-Diagnosed_PDF_ABTA1223.pdf"
+"https://www.cancerresearchuk.org/about-cancer/brain-tumours/diagnosis/tests",
+"https://www.cancer.org/cancer/types/brain-spinal-cord-tumors-adults/detection-diagnosis-staging.html",
+"https://www.thebraintumourcharity.org/brain-tumour-diagnosis-treatment/types-of-brain-tumour-adult/glioma/",
+"https://www.thebraintumourcharity.org/brain-tumour-diagnosis-treatment/types-of-brain-tumour-adult/meningioma/",
+"https://www.cancer.org/cancer/types/pituitary-tumors/detection-diagnosis-staging.html",
+    
 ]
 
 ALL_LINKS = list(dict.fromkeys(LINKS))
@@ -529,13 +497,72 @@ def build_faiss_from_sources(jsonl_path: str = JSONL_PATH,
     print(f"[RAG] index.faiss mtime: {faiss_mtime}")
     print(f"[RAG] index.pkl   mtime: {pkl_mtime}")
 
+def build_two_indexes(jsonl_path: str = JSONL_PATH,
+                      qa_jsonl_path: str = QA_JSONL_PATH,
+                      qa_csv_path: str = QA_CSV_PATH,
+                      rag_evidence_dir: str = os.path.join(SAVE_ROOT, "rag_index_evidence"),
+                      rag_qa_dir: str = os.path.join(SAVE_ROOT, "rag_index_qa"),
+                      emb_model: str = EMBED_MODEL,
+                      force_rebuild: bool = FORCE_REBUILD):
+
+    docs_text = _read_jsonl_docs(jsonl_path)
+    docs_qa = _read_qa_jsonl(qa_jsonl_path) + _read_qa_csv(qa_csv_path)
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name=emb_model,
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True},
+    )
+
+    # ---- Evidence index ----
+    os.makedirs(rag_evidence_dir, exist_ok=True)
+    if force_rebuild:
+        for f in ("index.faiss", "index.pkl"):
+            p = os.path.join(rag_evidence_dir, f)
+            if os.path.exists(p):
+                os.remove(p)
+
+    print(f"[RAG] Building EVIDENCE index with {len(docs_text)} docs -> {rag_evidence_dir}")
+    vs_e = FAISS.from_documents(docs_text, embeddings)
+    vs_e.save_local(rag_evidence_dir)
+
+    # ---- QA index ----
+    os.makedirs(rag_qa_dir, exist_ok=True)
+    if force_rebuild:
+        for f in ("index.faiss", "index.pkl"):
+            p = os.path.join(rag_qa_dir, f)
+            if os.path.exists(p):
+                os.remove(p)
+
+    print(f"[RAG] Building QA index with {len(docs_qa)} docs -> {rag_qa_dir}")
+    vs_q = FAISS.from_documents(docs_qa, embeddings)
+    vs_q.save_local(rag_qa_dir)
+
+    print("[RAG] Done.")
+
+
 # --- Ingest locally placed PDFs in corpus/pdfs (not tied to a URL) ---
 def _sha1_bytes(b: bytes) -> str:
     import hashlib
     return hashlib.sha1(b).hexdigest()
 
+def is_pdf_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == b"%PDF"
+    except Exception:
+        return False
+
+
 def ingest_local_pdfs(jsonl_path: str, pdf_dir: str = PDF_DIR):
     """Append local PDFs that don't already exist in JSONL."""
+    num_pdfs = 0
+    # example loop – your code may be slightly different:
+    for fname in os.listdir(pdf_dir):
+        if not fname.lower().endswith(".pdf"):
+            continue
+        num_pdfs += 1
+        full_path = os.path.join(pdf_dir, fname)
     # 1) collect already indexed (by local_path) to avoid duplicates
     already = set()
     if os.path.exists(jsonl_path):
@@ -559,9 +586,17 @@ def ingest_local_pdfs(jsonl_path: str, pdf_dir: str = PDF_DIR):
             rel_local = os.path.relpath(fpath, SAVE_ROOT).replace("\\", "/")
             if rel_local in already:
                 continue
+            if not is_pdf_file(fpath):
+                    print(f"[SKIP] Not a real PDF (bad header): {rel_local}")
+                    continue
 
             try:
-                raw = read_pdf_text(fpath)
+                try:
+                    raw = read_pdf_text(fpath)
+                except Exception as e:
+                    print(f"[SKIP] PDF read failed: {rel_local} -> {type(e).__name__}: {e}")
+                    continue
+                
                 txt = sanitize(raw)
                 year = extract_year(txt)
                 tumor = guess_tumor_type(txt)
@@ -589,13 +624,13 @@ def ingest_local_pdfs(jsonl_path: str, pdf_dir: str = PDF_DIR):
                 print(f"OK (local): {rel_local} ({len(chunks)} chunks)")
             except Exception as e:
                 print(f"FAILED (local): {rel_local} -> {e}")
-
+    print(f"[PDF] Ingested {num_pdfs} PDFs from {pdf_dir}")
     print(f"[Local PDFs] Newly ingested: {new_count}")
 
 
-# ---------- Run ----------loader.load()
+
 if __name__ == "__main__":
     # 1) Rebuild the main text JSONL from links
     main()
     # 2) Build (or rebuild) FAISS, merging in any Q/A JSONL or CSV found
-    build_faiss_from_sources(JSONL_PATH, QA_JSONL_PATH, QA_CSV_PATH, RAG_DIR, EMBED_MODEL, FORCE_REBUILD)
+    build_two_indexes(JSONL_PATH, QA_JSONL_PATH, QA_CSV_PATH)
