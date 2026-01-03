@@ -1,612 +1,480 @@
-# -*- coding: utf-8 -*-
-import os, time, traceback
+# app_brisc_segaware.py
+# ---------------------------------------------------------
+# BRISC2025 Tumor Classifier (Clean + Seg-aware)
+# - Loads best TorchScript classifier from brisc_exports/brisc_classifier.pt
+# - Optionally loads U-Net seg from brisc_exports/brisc_unet_seg.pt
+# - Uses BRISC2025Loader (configs/brisc.yaml) for preprocessing
+# - Adds:
+#     * ROI-assisted ensemble (crop around tumor mask) with TRUST GATE
+#     * Conservative no_tumor guard using seg area
+#     * Uncertainty note for close top-2 probs
+#
+# Educational use only. Not a medical device.
+# ---------------------------------------------------------
+
+import os
+import io
+import json
+
+import numpy as np
+import cv2
+from PIL import Image
+
+import torch
+import torch.nn.functional as F
 import gradio as gr
-import re
-import logging, warnings
-from transformers.utils.logging import set_verbosity_error
-set_verbosity_error()
-logging.getLogger("transformers").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", category=UserWarning)
-from openai import AzureOpenAI
-from dotenv import load_dotenv
-load_dotenv() 
-from pathlib import Path
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+from utils.config import load_cfg
+from data.loader_registry import get_loader  # must map "brisc2025" -> BRISC2025Loader
 
+# -------------------------
+# Paths / Config
+# -------------------------
 
-from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
-from transformers import (
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    Text2TextGenerationPipeline,
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CFG = load_cfg(os.path.join(BASE_DIR, "configs", "brisc.yaml"))
+
+BRISC_CLS_PT = os.getenv(
+    "BRISC_CLS_PT",
+    os.path.join(BASE_DIR, "brisc_exports", "brisc_classifier.pt"),
+)
+BRISC_SEG_PT = os.getenv(
+    "BRISC_SEG_PT",
+    os.path.join(BASE_DIR, "brisc_exports", "brisc_unet_seg.pt"),
 )
 
-try:
-    from peft import PeftModel
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
+LABELS = list(CFG.inference.labels)  # ["glioma", "meningioma", "no_tumor", "pituitary"]
+DEVICE = torch.device("cpu")  # keep CPU for portability; flip if you want to use cuda
 
-# ================== CONFIG ==================
+# ---- Seg-aware heuristics (tunable) ----
+RAW_MIN_KEEP   = 0.60   # if raw prob >= this, keep raw label
+ALT_MIN        = 0.85   # alternative prob must be at least this to flip (when raw is low)
+GAP_MIN        = 0.20   # alternative - raw must exceed this gap to flip
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-
-# FAISS index dir (built by brain_tumor_corpus.py)
-RAG_DIR = os.getenv("RAG_DIR", os.path.join(BASE, "corpus", "rag_index_evidence"))
-
-#RAG_DIR = "C:\Fatima_Final_Bot\BrainTumorChatbot\corpus\rag_index_evidence"
-
-# LoRA finetuned adapters directory
-LOCAL_FINETUNE_DIR = os.path.join(BASE, "models", "flan_t5_brain_qa")
-
-# Base model
-BASE_LLM_ID = "google/flan-t5-base"
-DEFAULT_LLM_ID = "google/flan-t5-large"
-
-# Embedding model
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
-
-AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "https://fatimagpt.cognitiveservices.azure.com/")
-AZURE_API_KEY = os.getenv("AZURE_API_KEY", "")
-AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
-AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "o1")
-
-LLM_MODE = os.getenv("LLM_MODE", "azure")
-MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "2000"))
+EDGE_MARGIN    = 0.10   # meningioma: bbox touches image edge within 10%
+SELLA_MID_TOL  = 0.12   # pituitary: x close to midline (±12% of width)
+SELLA_LOW_BAND = 0.45   # pituitary: y in lower ~45% of image
 
 
-
-# Token limits
-
-MAX_DOCS_FOR_CONTEXT = 4
-MAX_CHARS_PER_DOC = 1200
-
-# Legacy settings (for local model fallback)
-# Generation 
-MAX_NEW_TOK = 384
-MAX_INPUT_TOK = 512
-TOPK_DEFAULT = 3
-
-GEN_KWARGS = dict(
-    max_new_tokens=MAX_NEW_TOK,
-    num_beams=4,
-    do_sample=True,
-    no_repeat_ngram_size=3,
-    repetition_penalty=1.1,
-    #early_stopping=True,
-    temperature=0.7, 
-    top_p=0.9
-)
-
-# ================== GLOBALS ==================
-_emb = None
-_vs = None
-_llm = None
-_tok = None
-_azure_client = None
-
-# STEP 3: Add these NEW FUNCTIONS for Azure OpenAI
-# ============================================================================
-
-def _init_azure():
-    """Initialize Azure OpenAI client"""
-    global _azure_client
-    if _azure_client is None:
-        if not AZURE_API_KEY or AZURE_API_KEY == "<your-api-key>":
-            raise ValueError(
-                "Azure API key not set! Please set AZURE_API_KEY in the config section."
-            )
-        
-        _azure_client = AzureOpenAI(
-            api_version=AZURE_API_VERSION,
-            azure_endpoint=AZURE_ENDPOINT,
-            api_key=AZURE_API_KEY,
-        )
-        print(f"[LLM] ✓ Azure OpenAI initialized successfully")
-        print(f"[LLM] Endpoint: {AZURE_ENDPOINT}")
-        print(f"[LLM] Deployment: {AZURE_DEPLOYMENT_NAME}")
-    
-    return _azure_client
+def _edge_contact(bbox, H, W, margin=EDGE_MARGIN):
+    (x1, y1, x2, y2) = bbox
+    return (x1 <= W * margin) or (x2 >= W * (1 - margin)) or (y1 <= H * margin) or (y2 >= H * (1 - margin))
 
 
-def _build_prompt_azure(question: str, docs, audience: str = "Patient") -> tuple:
-    """Build system and user prompts for Azure OpenAI."""
-    
-    is_clinician = (audience or "").strip().lower().startswith("clin")
-    
-    if is_clinician:
-        system_prompt = """Medical AI for healthcare professionals. Provide evidence-based responses with medical terminology covering: tumor type/location, symptoms, diagnostics, treatments. Keep general; specifics determined by treating team."""
-    else:
-        system_prompt = """Medical AI helping patients understand brain tumors. Use simple language. Cover: what tumor is, where it grows, symptoms, tests, treatments. Clarify AI predictions aren't final diagnoses."""
-
-    # Build context
-    docs = list(docs)[:MAX_DOCS_FOR_CONTEXT]
-    context_parts = []
-    
-    for i, doc in enumerate(docs, 1):
-        content = (doc.page_content or "").strip()
-        if content:
-            truncated = content[:MAX_CHARS_PER_DOC]
-            context_parts.append(f"[{i}] {truncated}")
-    
-    context = "\n\n".join(context_parts) if context_parts else "No relevant information found."
-    
-    user_prompt = f"""Context: {context}
-
-Q: {question}
-
-Provide a complete answer (6-8 sentences)."""
-
-    return system_prompt, user_prompt
+def _near_sella(bbox, H, W, mid_tol=SELLA_MID_TOL, low_band=SELLA_LOW_BAND):
+    (x1, y1, x2, y2) = bbox
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    return (abs(cx / W - 0.5) <= mid_tol) and (cy / H >= (1.0 - low_band))
 
 
-def _call_azure(system_prompt: str, user_prompt: str, audience: str) -> str:
-    """Call Azure OpenAI API."""
-    client = _init_azure()
-    
-    try:
-        response = client.chat.completions.create(
-            model=AZURE_DEPLOYMENT_NAME,  # ← Uses your deployment name
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            reasoning_effort="low", 
-            max_completion_tokens=MAX_OUTPUT_TOKENS,  # ← Note: max_completion_tokens for Azure
-        )
-        
-        # Log usage
-        usage = response.usage
-        print(f"[AZURE] Tokens - Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens}, Total: {usage.total_tokens}")
-        
-        # Azure o1 pricing (adjust if using different model)
-        # o1 is expensive: ~$15/1M prompt tokens, ~$60/1M completion tokens
-        cost = (usage.prompt_tokens * 15 + usage.completion_tokens * 60) / 1_000_000
-        print(f"[AZURE] Estimated cost: ${cost:.6f}")
-        
-        text = response.choices[0].message.content
-        text = (text or "").strip()
-
-        if not text:
-            # fall back so UI never stays blank
-            text = (
-                "I couldn't generate a complete answer within the current token limit. "
-                "Please try again, or increase MAX_OUTPUT_TOKENS."
-            )
-
-        return text
-
-               
-    except Exception as e:
-        print(f"[AZURE ERROR] {type(e).__name__}: {e}")
-        return f"Azure OpenAI API Error: {str(e)}\nPlease check your API key and endpoint."
+def _region_supports(label, bbox, H, W):
+    if label == "meningioma":
+        return _edge_contact(bbox, H, W)
+    if label == "pituitary":
+        return _near_sella(bbox, H, W)
+    return True
 
 
-# ================== HELPERS ==================
+# -------------------------
+# Loader (exact training preproc)
+# -------------------------
 
-def _init_embeddings():
-    global _emb
-    if _emb is None:
-        _emb = HuggingFaceEmbeddings(
-            model_name=EMBED_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
-    return _emb
+Loader = get_loader("brisc2025")
+_loader = Loader(CFG.preproc)
 
 
-def _load_index(rag_dir: str):
-    global _vs
+def preprocess_pil(img: Image.Image) -> torch.Tensor:
+    """
+    EXACTLY match BRISC2025Loader:
+      - convert to RGB
+      - gray3 or rgb based on config
+      - center crop (center_crop_frac)
+      - resize to input_size
+      - [0,1] + per-image zscore (or mean/std) as in brisc.yaml
+    """
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="PNG")
+    arr = _loader.decode_upload(buf.getvalue())  # HxWx3
+    x = _loader.to_tensor(arr)                   # 3xH'xW'
+    x = _loader.normalize(x)                     # same normalization as training
+    return x.unsqueeze(0).to(DEVICE)             # 1x3xH'xW'
 
-    print("[RAG] Loading index from:", rag_dir)  
-    emb = _init_embeddings()
-    faiss_path = os.path.join(rag_dir, "index.faiss")
-    pkl_path = os.path.join(rag_dir, "index.pkl")
-    if not (os.path.exists(faiss_path) and os.path.exists(pkl_path)):
-        raise FileNotFoundError(
-            f"Missing index files in: {rag_dir}\n"
-            "Run brain_tumor_corpus.py first to build the index."
-        )
-    _vs = FAISS.load_local(rag_dir, emb, allow_dangerous_deserialization=True)
-    m1 = time.ctime(os.path.getmtime(faiss_path))
-    m2 = time.ctime(os.path.getmtime(pkl_path))
-    return (
-        f"Loaded index (ntotal={_vs.index.ntotal}, dim={_vs.index.d})\n"
-        f"index.faiss: {m1}\nindex.pkl:   {m2}"
 
+# -------------------------
+# Segmentation helpers
+# -------------------------
+
+def make_overlay(orig_pil: Image.Image, mask_224: np.ndarray, alpha: float = 0.45) -> Image.Image:
+    """Overlay red transparent mask on original image."""
+    if mask_224 is None:
+        return orig_pil
+    ow, oh = orig_pil.size
+    mask_img = Image.fromarray(mask_224.astype(np.uint8) * 255, mode="L").resize(
+        (ow, oh), resample=Image.NEAREST
     )
+    overlay = Image.new("RGBA", (ow, oh), (0, 0, 0, 0))
+    opx, mpx = overlay.load(), mask_img.load()
+    for y in range(oh):
+        for x in range(ow):
+            if mpx[x, y] > 0:
+                opx[x, y] = (255, 0, 0, int(255 * alpha))
+    base = orig_pil.convert("RGBA")
+    return Image.alpha_composite(base, overlay).convert("RGB")
 
 
-def _load_llm():
-    """Load LLM - Azure OpenAI or local model based on LLM_MODE."""
-    global _llm, _tok
-    
-    if LLM_MODE == "azure":
-        print("[LLM] Mode: Azure OpenAI")
-        _init_azure()
+def _largest_cc_bbox(mask: np.ndarray, pad_frac: float = 0.10):
+    """mask: HxW uint8 {0,1} -> padded (x1,y1,x2,y2) or None."""
+    if mask is None:
         return None
-    
-    # Local model fallback (same as before)
-    if _llm is not None:
-        return _llm
-    
-    print("[LLM] Mode: Local model (LoRA or base)")
-    
-    try:
-        from peft import PeftModel
-        PEFT_AVAILABLE = True
-    except ImportError:
-        PEFT_AVAILABLE = False
-    
-    use_lora = (
-        LLM_MODE == "lora"
-        and PEFT_AVAILABLE
-        and os.path.isdir(LOCAL_FINETUNE_DIR)
-        and os.path.exists(os.path.join(LOCAL_FINETUNE_DIR, "adapter_config.json"))
+    if mask.ndim == 3:
+        mask = mask.squeeze()
+    m = (mask > 0).astype(np.uint8)
+    if m.sum() == 0:
+        return None
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num_labels <= 1:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    idx = 1 + int(np.argmax(areas))
+    x, y, w, h = (
+        stats[idx, cv2.CC_STAT_LEFT],
+        stats[idx, cv2.CC_STAT_TOP],
+        stats[idx, cv2.CC_STAT_WIDTH],
+        stats[idx, cv2.CC_STAT_HEIGHT],
     )
-
-    if use_lora:
-        print(f"[LLM] Loading LoRA model from {LOCAL_FINETUNE_DIR}")
-        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Text2TextGenerationPipeline
-        base_model = AutoModelForSeq2SeqLM.from_pretrained(BASE_LLM_ID)
-        lora_model = PeftModel.from_pretrained(base_model, LOCAL_FINETUNE_DIR)
-        model = lora_model.merge_and_unload()
-        _tok = AutoTokenizer.from_pretrained(BASE_LLM_ID, use_fast=True)
-    else:
-        print(f"[LLM] Loading base model: {DEFAULT_LLM_ID}")
-        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Text2TextGenerationPipeline
-        model = AutoModelForSeq2SeqLM.from_pretrained(DEFAULT_LLM_ID)
-        _tok = AutoTokenizer.from_pretrained(DEFAULT_LLM_ID, use_fast=True)
-    
-    _tok.model_max_length = 512
-    _tok.truncation_side = "left"
-    _llm = Text2TextGenerationPipeline(model=model, tokenizer=_tok, device=-1, **GEN_KWARGS)
-    
-    return _llm
+    H, W = m.shape
+    pad = int(pad_frac * max(H, W))
+    x1 = max(0, x - pad)
+    y1 = max(0, y - pad)
+    x2 = min(W, x + w + pad)
+    y2 = min(H, y + h + pad)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
 
 
-def _count_tokens(text: str) -> int:
-    """Count tokens in text"""
-    global _tok
-    if _tok is None:
-        _load_llm()
-    return len(_tok.encode(text, truncation=False, add_special_tokens=False))
+def _prep_tensor_from_np_with_loader(arr_rgb: np.ndarray) -> torch.Tensor:
+    """Use same BRISC loader on an RGB numpy crop."""
+    pil = Image.fromarray(arr_rgb)
+    buf = io.BytesIO()
+    pil.convert("RGB").save(buf, format="PNG")
+    arr = _loader.decode_upload(buf.getvalue())
+    x = _loader.to_tensor(arr)
+    x = _loader.normalize(x)
+    return x.unsqueeze(0).to(DEVICE)
 
 
-def _truncate_to_tokens(text: str, max_tokens: int) -> str:
-    """Truncate text to max tokens"""
-    global _tok
-    if _tok is None:
-        _load_llm()
-    
-    tokens = _tok.encode(text, truncation=False, add_special_tokens=False)
-    if len(tokens) <= max_tokens:
-        return text
-    
-    truncated_tokens = tokens[:max_tokens]
-    return _tok.decode(truncated_tokens, skip_special_tokens=True)
+# -------------------------
+# Model loading
+# -------------------------
+
+_cls_model = None
+_seg_model = None
 
 
-def _clean_content(content: str) -> str:
-    """Clean document content to remove QA formatting and other noise - less aggressive"""
-    if not content:
-        return ""
-    
-    content = re.sub(r'Q:\s.*?\bA:\s*', '', content, flags=re.IGNORECASE | re.DOTALL)
+def load_models():
+    global _cls_model, _seg_model
 
-    
-    # Remove QA pairs that look like training data
-    lines = content.split('\n')
-    clean_lines = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line or len(line) < 5:
-            continue
-        
-        m_q = re.match(r'^(?:Q:|Question:)\s*(.*)$', line, flags=re.IGNORECASE)
-        if m_q:
-            qbody = m_q.group(1).strip()
-            if qbody.endswith("?"):
-                continue  # real question line → skip
-            line = qbody  # keep if it looks like a statement
+    if _cls_model is None:
+        if not os.path.exists(BRISC_CLS_PT):
+            raise FileNotFoundError(
+                f"Classifier PT not found at {BRISC_CLS_PT}.\n"
+                "Run train_brisc_resnet.py / export_models.py first."
+            )
+        m = torch.jit.load(BRISC_CLS_PT, map_location=DEVICE)
+        m.eval()
+        _cls_model = m
+        print("[INIT] Loaded classifier from", BRISC_CLS_PT)
+        print("[INIT] Labels:", LABELS)
 
-        # If the line starts with A:/Answer:, KEEP the content (do not skip!)
-        m_a = re.match(r'^(?:A:|Answer:)\s*(.*)$', line, flags=re.IGNORECASE)
-        if m_a:
-            line = m_a.group(1).strip()
-        clean_lines.append(line)
-    
-    clean_content = " ".join(clean_lines)
-    
-    # Remove multiple spaces
-    clean_content = re.sub(r"\s+", " ", clean_content).strip()
-    
-    return clean_content
-
-
-# def _is_qa_training_data(content: str) -> bool:
-#     """Return True only for obvious multi-Q/A training shards - higher threshold."""
-#     if not content:
-#         return False
-#     t = content.lower()
-
-#     # Count explicit Q/A labels - require more for flagging
-#     q_count = t.count("q:") + t.count("question:")
-#     a_count = t.count("a:") + t.count("answer:")
-
-#     if (q_count + a_count) >= 10:  # Increased from 3
-#         return True
-#     bullet_count = len(re.findall(r'(?m)^\s*[•-]\s+', content))
-#     question_marks = t.count("?")
-#     return bullet_count >= 20 and question_marks >= 10
-#     # bullet_count = content.count("•") + content.count("-")
-#     # if bullet_count >= 15 and question_marks >= 8:  # Increased thresholds
-#     #     return True
-
-#     # Count real bullets at line starts, not hyphens inside words
-    
-#     #question_marks = t.count("?")
-
-#     # Only treat as QA if it's BOTH bullet-heavy AND question-heavy
-    
-#     #return False
-
-def _build_prompt(question: str, docs, audience: str = "Patient", max_input_tokens: int = MAX_INPUT_TOK) -> str:
-    """
-    Build a very compact RAG prompt that fits in 512 tokens.
-    """
-    
-    is_clinician = (audience or "").strip().lower().startswith("clin")
-    
-    # VERY SHORT instructions
-    if is_clinician:
-        instruction = """Using CONTEXT below, answer clinically: (1) tumor type & location, (2) symptoms, (3) tests needed, (4) treatment options. Use medical terms. 6-8 sentences."""
-    else:
-        instruction = """Using CONTEXT below, answer in simple words: (1) what this tumor is & where it grows, (2) symptoms, (3) tests doctors do, (4) treatments available. Explain terms simply. 6-8 sentences."""
-
-    # Limit to 3 docs with smaller budget per doc
-    docs = list(docs)[:3]
-    context_lines = []
-    per_doc_budget = 70  # Reduced from 90
-
-    for i, doc in enumerate(docs, 1):
-        content = (doc.page_content or "").strip()
-        if not content:
-            continue
-        snippet = _truncate_to_tokens(content, per_doc_budget)
-        if snippet:
-            context_lines.append(f"[{i}] {snippet}")
-
-    context = "\n".join(context_lines) if context_lines else "No context."
-
-    # Ultra-compact structure
-    full_prompt = f"""{instruction}
-
-CONTEXT:
-{context}
-
-Q: {question.strip()}
-
-A:"""
-
-    total_tokens = _count_tokens(full_prompt)
-    print(f"[RAG DEBUG] Audience={audience} | Prompt tokens={total_tokens}/{max_input_tokens}")
-
-    return full_prompt
-
-
-def _extract_answer(text: str) -> str:
-    """
-    Extract clean answer from LLM output.
-    Handles prompt echoes, partial outputs, and formatting issues.
-    """
-    DEFAULT = "I cannot find specific information about this in the available documents."
-
-    text = (text or "").strip()
-    if not text:
-        return DEFAULT
-
-    # If output starts with "A:" or "ANSWER:", take what comes after
-    if text.startswith(("A:", "A :", "ANSWER:", "Answer:")):
-        text = re.sub(r'^A\s*:\s*', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'^ANSWER\s*:\s*', '', text, flags=re.IGNORECASE)
-        text = text.strip()
-
-    # Remove any context/question echoes
-    text = re.sub(r'(?i)^.*?(?:CONTEXT|QUESTION|Q)\s*:.*?(?=\n|$)', '', text, flags=re.MULTILINE)
-    
-    # Remove instruction echoes
-    instruction_patterns = [
-        r'(?i)using context below.*?(?:\.|$)',
-        r'(?i)answer (?:in simple words|clinically).*?(?:\.|$)',
-        r'(?i)MRI scan:.*?Not confirmed diagnosis\.',
-    ]
-    
-    for pattern in instruction_patterns:
-        text = re.sub(pattern, '', text)
-    
-    # Clean up
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    # If it's just the scan description echoed back, return default
-    if len(text) < 40 or text.lower().startswith('mri scan:'):
-        return DEFAULT
-    
-    # Remove any remaining formatting artifacts
-    text = text.replace('**', '').strip()
-    
-    return text or DEFAULT
-
-
-# ================== CORE ==================filtered_docs:
-
-def on_load(rag_dir):
-    try:
-        return _load_index(rag_dir)
-    except Exception as e:
-        return f"ERROR: {type(e).__name__}: {e}"
-
-
-# STEP 4: REPLACE the answer() function with this Azure-aware version
-# ============================================================================
-
-def answer(question, top_k, audience="Patient"):
-    """Main RAG answer function - uses Azure OpenAI or local model based on LLM_MODE."""
-
-    question = (question or "").strip()
-    if not question:
-        return "", "", "", "", "", "Please type a question."
-
-    try:
-        global _vs
-
-        if _vs is None:
-            status = _load_index(RAG_DIR)
-
-        _ = _load_llm()
-
-        # Retrieval
-        k = min(int(top_k), 5) if top_k else TOPK_DEFAULT
-        filtered_docs = []
-
+    if _seg_model is None and os.path.exists(BRISC_SEG_PT):
         try:
-            docs_scores = _vs.similarity_search_with_score(question, k=max(k * 4, 20))
-        except TypeError:
-            base_docs = _vs.similarity_search(question, k=max(k * 4, 20))
-            docs_scores = [(d, None) for d in base_docs]
+            s = torch.jit.load(BRISC_SEG_PT, map_location=DEVICE)
+            s.eval()
+            _seg_model = s
+            print("[INIT] Loaded segmentation model from", BRISC_SEG_PT)
+        except Exception as e:
+            print("[WARN] Failed to load seg model:", e)
+            _seg_model = None
 
-        from collections import Counter
-        print("DOC TYPE COUNTS:", Counter(((d.metadata or {}).get("doc_type", "NONE") for d, _ in docs_scores)))
+    return _cls_model, _seg_model
 
-        if not docs_scores:
-            return ("No relevant information found.", "", "", "", "", "No retrieval results.")
 
-        # Filter (keep only evidence docs, skip qa_pair + unknown sources)
-        for doc, score in docs_scores:
-            content = (doc.page_content or "").strip()
-            meta = doc.metadata or {}
+# -------------------------
+# Core inference
+# -------------------------
 
-            doc_type = (meta.get("doc_type") or "").lower()
-            source = (meta.get("source") or "").lower()
-            qa_source = (meta.get("qa_source") or "").lower()
+def classify_brisc_segaware(img: Image.Image):
+    if img is None:
+        return "No image.", "No image.", "{}", None, "No image provided."
 
-            # Skip synthetic QA pairs
-            if doc_type == "qa_pair":
-                continue
+    cls_model, seg_model = load_models()
+    orig = img.convert("RGB")
+    x = preprocess_pil(orig)  # 1x3xHxW
 
-            # Skip anything with unknown/empty source
-            if source in ("", "unknown"):
-                continue
+    dbg_lines = []
 
-            # Old filter (optional)
-            if "qa_jsonl" in source or "qa_json" in source or "qa_jsonl" in qa_source:
-                continue
+    # --- segmentation ---
+    seg_mask_224 = None
+    tumor_frac = None
+    if seg_model is not None:
+        try:
+            with torch.no_grad():
+                seg_out = seg_model(x)  # [1,C,H,W] or [1,1,H,W]
+            if seg_out.ndim == 4:
+                if seg_out.shape[1] > 1:
+                    seg_cls = torch.argmax(seg_out, dim=1)[0].cpu().numpy()
+                    seg_mask_224 = (seg_cls > 0).astype(np.uint8)
+                else:
+                    seg_prob = torch.sigmoid(seg_out)[0, 0].cpu().numpy()
+                    seg_mask_224 = (seg_prob > 0.5).astype(np.uint8)
+            tumor_frac = float(seg_mask_224.mean()) if seg_mask_224 is not None else None
+            if tumor_frac is not None:
+                dbg_lines.append(f"Seg tumor_frac: {tumor_frac:.5f}")
+        except Exception as e:
+            dbg_lines.append(f"Segmentation error: {type(e).__name__}: {e}")
+            seg_mask_224 = None
+            tumor_frac = None
+    else:
+        dbg_lines.append("Seg model not loaded; running classifier only.")
 
-            filtered_docs.append(doc)
-            if len(filtered_docs) >= k:
-                break
+    # --- classifier: whole image (raw baseline) ---
+    with torch.no_grad():
+        logits = cls_model(x)
+        probs_base = F.softmax(logits, dim=1)[0].cpu().numpy()
 
-        # IMPORTANT: do NOT fall back to QA silently
-        if not filtered_docs:
-            return (
-                "No evidence documents found in retrieval (only qa_pair chunks were returned).",
-                "", "", "", "",
-                "No non-QA sources available. Rebuild/load the evidence index."
+    if probs_base.shape[0] != len(LABELS):
+        msg = (
+            f"Label mismatch: model has {probs_base.shape[0]} outputs, "
+            f"but LABELS has {len(LABELS)}. Check config/export."
+        )
+        return msg, msg, "{}", None, msg
+
+    raw_idx = int(np.argmax(probs_base))
+    raw_label = LABELS[raw_idx]
+    raw_top = float(probs_base[raw_idx])
+    dbg_lines.append(f"Raw: {raw_label} ({raw_top:.3f})")
+
+    # start with whole-image probs; may be refined by ROI
+    probs = probs_base.copy()
+
+    # -----------------------------
+    # ROI-assisted ensemble (build bbox first)
+    # -----------------------------
+    roi_debug = None
+    roi_bbox = None
+    nt_idx = LABELS.index("no_tumor") if "no_tumor" in LABELS else None
+
+    if seg_mask_224 is not None and seg_mask_224.sum() > 0:
+        try:
+            ow, oh = orig.size
+            seg_up = Image.fromarray(seg_mask_224 * 255, mode="L").resize((ow, oh), resample=Image.NEAREST)
+            seg_np = np.array(seg_up)
+            bbox = _largest_cc_bbox(seg_np, pad_frac=0.10)
+
+            if bbox is not None:
+                roi_bbox = bbox
+                x1, y1, x2, y2 = bbox
+                full_np = np.array(orig)
+                crop = full_np[y1:y2, x1:x2, :].copy()
+
+                if crop.size > 0:
+                    crop_mask = seg_np[y1:y2, x1:x2]
+                    crop_masked = crop.copy()
+                    crop_masked[crop_mask == 0] = (crop_masked[crop_mask == 0] * 0.25).astype(crop_masked.dtype)
+
+                    x_roi = _prep_tensor_from_np_with_loader(crop_masked)
+
+                    with torch.no_grad():
+                        logits_roi = cls_model(x_roi)
+                        probs_roi = F.softmax(logits_roi, dim=1)[0].cpu().numpy()
+
+                    # -----------------------------
+                    # ROI trust gate (prevents ROI drift)
+                    # -----------------------------
+                    H, W = np.array(orig).shape[:2]
+                    bbox_area = max(1, (x2 - x1) * (y2 - y1))
+                    bbox_frac = bbox_area / float(H * W)
+
+                    roi_top_idx = int(np.argmax(probs_roi))
+                    roi_top_lbl = LABELS[roi_top_idx]
+                    roi_top_p = float(probs_roi[roi_top_idx])
+
+                    skip_reason = None
+
+                    # 1) bbox too tiny / too huge
+                    if bbox_frac < 0.002:
+                        skip_reason = f"bbox too small (bbox_frac={bbox_frac:.4f})"
+                    elif bbox_frac > 0.60:
+                        skip_reason = f"bbox too large (bbox_frac={bbox_frac:.4f})"
+
+                    # 2) ROI not confident
+                    elif roi_top_p < 0.70:
+                        skip_reason = f"ROI not confident (top={roi_top_lbl} p={roi_top_p:.3f})"
+
+                    # 3) Pituitary sanity: should be near sella
+                    elif raw_label == "pituitary" and (not _near_sella(bbox, H, W)):
+                        skip_reason = "raw pituitary but ROI bbox not near sella"
+
+                    if skip_reason:
+                        dbg_lines.append(f"Skip ROI ensemble: {skip_reason}")
+                    else:
+                        ROI_ALPHA = 0.25  # lower than 0.6 reduces drift
+                        probs_ens = probs.copy()
+
+                        # blend ONLY tumor classes; leave 'no_tumor' as is
+                        for i in range(len(LABELS)):
+                            if (nt_idx is not None) and (i == nt_idx):
+                                continue
+                            probs_ens[i] = (1.0 - ROI_ALPHA) * probs[i] + ROI_ALPHA * probs_roi[i]
+
+                        # renormalize
+                        s = float(probs_ens.sum())
+                        if s > 0:
+                            probs_ens = probs_ens / s
+
+                        probs = probs_ens
+                        roi_debug = {
+                            "bbox": [int(v) for v in bbox],
+                            "probs_roi": {LABELS[i]: float(probs_roi[i]) for i in range(len(LABELS))},
+                        }
+                        dbg_lines.append(f"ROI ensemble applied (alpha={ROI_ALPHA}) on tumor classes only.")
+
+        except Exception as e:
+            dbg_lines.append(f"ROI ensemble error: {type(e).__name__}: {e}")
+
+    # -----------------------------
+    # Decide final label from probs AFTER ROI (if any)
+    # -----------------------------
+    final_idx = int(np.argmax(probs))
+    final_label = LABELS[final_idx]
+
+    # -----------------------------
+    # Guard: strong seg + strong raw tumor → don't let ensemble flip to no_tumor
+    # -----------------------------
+    if (
+        tumor_frac is not None
+        and tumor_frac > 0.03
+        and raw_label != "no_tumor"
+        and raw_top >= 0.80
+        and final_label == "no_tumor"
+    ):
+        dbg_lines.append("Guard: strong mask + strong raw tumor → ignore ensemble no_tumor.")
+        probs = probs_base.copy()
+        final_idx = raw_idx
+        final_label = raw_label
+
+    # -----------------------------
+    # seg-aware no_tumor guard (tiny mask only)
+    # -----------------------------
+    adjusted_label = final_label
+    if (tumor_frac is not None) and (nt_idx is not None) and (final_label != "no_tumor"):
+        NO_TUMOR_MAX_FRAC = 0.02  # <2% seg area
+        CONF_CUTOFF = 0.90
+        NT_RATIO_MIN = 0.6
+        p_top = float(probs[final_idx])
+        p_nt = float(probs[nt_idx])
+        if (tumor_frac < NO_TUMOR_MAX_FRAC) and (p_top < CONF_CUTOFF) and (p_nt >= NT_RATIO_MIN * p_top):
+            adjusted_label = "no_tumor"
+            dbg_lines.append("Guard: tiny seg + not confident → override to no_tumor.")
+
+    # -----------------------------
+    # Conservative seg-aware flips between tumor classes (FIXED)
+    # -----------------------------
+    H, W = np.array(orig).shape[:2]
+    order = np.argsort(probs)[::-1]
+    top1_idx = int(order[0])
+    top2_idx = int(order[1]) if len(order) > 1 else top1_idx
+
+    top1_lbl = LABELS[top1_idx]
+    top2_lbl = LABELS[top2_idx]
+    top1_p = float(probs[top1_idx])
+    top2_p = float(probs[top2_idx])
+
+    flip_reason = "kept_raw"
+
+    # Only consider flipping away from raw if raw confidence was low
+    if raw_top < RAW_MIN_KEEP:
+        # Use TOP1 as the alternative candidate (not top2)
+        if (
+            top1_lbl != raw_label
+            and top1_p >= ALT_MIN
+            and (top1_p - raw_top) >= GAP_MIN
+            and roi_bbox is not None
+            and _region_supports(top1_lbl, roi_bbox, H, W)
+        ):
+            # don't flip to meningioma unless edge-contact holds
+            if not (top1_lbl == "meningioma" and not _edge_contact(roi_bbox, H, W)):
+                adjusted_label = top1_lbl
+                flip_reason = f"flip_to_{top1_lbl}_ALT_MIN_GAP_MIN_region_ok"
+            else:
+                flip_reason = "blocked_meningioma_no_edge"
+
+    # If pituitary was raw and ROI looks sellar, never flip away
+    if (raw_label == "pituitary") and (roi_bbox is not None) and _near_sella(roi_bbox, H, W):
+        adjusted_label = "pituitary"
+        flip_reason = "revert_pituitary_region_strong"
+
+    # Uncertainty note (top-2 close)
+    if len(order) >= 2:
+        margin = float(probs[order[0]] - probs[order[1]])
+        if margin < 0.12:
+            dbg_lines.append(
+                f"Uncertain: top-2 close ({LABELS[order[0]]} vs {LABELS[order[1]]}, Δ={margin:.3f})"
             )
 
-        # ✅ ADD THIS BLOCK HERE (RAG vs USED)
-        used_docs = filtered_docs[:k]
-        try:
-            _print_retrieval(docs_scores, used_docs)
-        except Exception:
-            pass
+    # -----------------------------
+    # Build outputs
+    # -----------------------------
+    probs_dict = {LABELS[i]: float(probs[i]) for i in range(len(LABELS))}
+    overlay = make_overlay(orig, seg_mask_224) if seg_mask_224 is not None else None
 
-        print(f"[RAG] Retrieved {len(docs_scores)} docs, using {len(filtered_docs)} | Mode: {LLM_MODE} | Audience: {audience}")
-        print("META SAMPLE:", (filtered_docs[0].metadata if filtered_docs else None))
+    if roi_debug is not None:
+        dbg_lines.append("ROI debug: " + json.dumps(roi_debug))
 
-        # Generation
-        if LLM_MODE == "azure":
-            system_prompt, user_prompt = _build_prompt_azure(question, filtered_docs, audience)
-
-            raw_text = _call_azure(system_prompt, user_prompt, audience)  # raw from model
-            text = _extract_answer(raw_text)  # cleaned + default if empty
-
-            prompt_debug = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
-
-            print(f"\n{'='*60}")
-            print(f"AZURE ANSWER ({audience}) RAW:\n{raw_text}")
-            print(f"\nCLEANED:\n{text}")
-            print('='*60)
-
-        else:
-            # Local model path
-            prompt_debug = _build_prompt_local(question, filtered_docs, audience)
-            result = _llm(prompt_debug, max_new_tokens=200, min_length=60)
-            raw_text = result[0]['generated_text'] if result else ""
-            text = _extract_answer(raw_text)
-
-        # Sources
-        src_lines = []
-        for i, d in enumerate(filtered_docs, 1):
-            meta = d.metadata or {}
-            src = meta.get("source_url") or meta.get("local_path") or meta.get("source") or "unknown"
-            if "qa_jsonl" not in src.lower():
-                src_lines.append(f"[{i}] {src}")
-
-        sources = "\n".join(src_lines) if src_lines else "(no sources)"
-        context_debug = "\n\n".join([f"[{i}] {d.page_content[:1500]}..." for i, d in enumerate(filtered_docs, 1)])
-        dbg = f"OK | Mode: {LLM_MODE} | {len(filtered_docs)} docs | Audience: {audience}"
-
-        return text, sources, prompt_debug, context_debug, raw_text, dbg
-
-    except Exception as e:
-        import traceback
-        return ("", "", "", "", "", f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-
-# ================== UI ==================
-# Replace the existing Gradio UI section in app_gradio_rag_only.py
-
-with gr.Blocks(title="Brain Tumor RAG — Medical QA") as demo:
-    gr.Markdown("## 🧠 Brain Tumor RAG — Medical QA")
-
-    rag_dir_in = gr.Textbox(value=RAG_DIR, label="RAG_DIR")
-    load_btn = gr.Button("Load Index", variant="primary")
-    status_box = gr.Textbox(label="Status", value="(click Load Index)", lines=4)
-
-    q = gr.Textbox(
-        label="Ask a question",
-        lines=3,
-        placeholder="e.g., What are the treatment options for brain tumors? What are the symptoms of glioma?",
+    dbg_lines.append(
+        f"SegAware info: raw={raw_label}({raw_top:.3f}) → adjusted={adjusted_label} "
+        f"| top1=({top1_lbl},{top1_p:.3f}) top2=({top2_lbl},{top2_p:.3f}) | reason={flip_reason}"
     )
-    
-    # Add audience selector
-    audience_selector = gr.Radio(
-        ["Patient", "Clinician"],
-        value="Patient",
-        label="Audience (who is asking?)"
+
+    dbg_text = "\n".join(dbg_lines) if dbg_lines else "(no debug info)"
+
+    return raw_label, adjusted_label, json.dumps(probs_dict, indent=2), overlay, dbg_text
+
+
+# -------------------------
+# Gradio UI
+# -------------------------
+
+with gr.Blocks(title="BRISC2025 Tumor Classifier (Clean + Seg-aware)") as demo:
+    gr.Markdown(
+        "## 🧠 BRISC2025 Tumor Classifier (Clean + Seg-aware)\n"
+        "_Educational use only. Not a medical device._"
     )
-    
-    topk = gr.Slider(1, 5, value=TOPK_DEFAULT, step=1, label="Top-K passages")
-    ask_btn = gr.Button("Answer", variant="primary")
 
-    ans = gr.Textbox(label="Answer", lines=10)
-    src = gr.Textbox(label="Sources", lines=6)
-    prompt_debug = gr.Textbox(label="Full Prompt (Debug)", lines=8)
-    context_debug = gr.Textbox(label="Context Used (Debug)", lines=16)
-    raw_output = gr.Textbox(label="Raw Model Output (Debug)", lines=4)
-    dbg = gr.Textbox(label="Debug", lines=4)
+    with gr.Row():
+        img_in = gr.Image(type="pil", label="Upload BRISC-style MRI slice (JPG/PNG)")
 
-    load_btn.click(on_load, inputs=[rag_dir_in], outputs=status_box)
-    
-    # Update to include audience parameter
-    ask_btn.click(
-        answer, 
-        inputs=[q, topk, audience_selector],  # <-- Added audience_selector
-        outputs=[ans, src, prompt_debug, context_debug, raw_output, dbg]
+    btn = gr.Button("Analyze", variant="primary")
+
+    gr.Markdown("### Prediction (raw + adjusted)")
+    out_raw = gr.Textbox(label="Predicted (raw)")
+    out_adj = gr.Textbox(label="Predicted (adjusted)")
+
+    gr.Markdown("### Class probabilities (JSON)")
+    out_probs = gr.Textbox(lines=10)
+
+    gr.Markdown("### Segmentation overlay")
+    out_overlay = gr.Image()
+
+    gr.Markdown("### Debug / Guard details")
+    out_dbg = gr.Textbox(lines=10)
+
+    btn.click(
+        classify_brisc_segaware,
+        inputs=img_in,
+        outputs=[out_raw, out_adj, out_probs, out_overlay, out_dbg],
     )
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7861, show_error=True)
+    demo.launch(server_name="127.0.0.1", server_port=7860, show_error=True)
