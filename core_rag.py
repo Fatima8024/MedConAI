@@ -6,6 +6,28 @@ from pathlib import Path
 from typing import Dict
 import sys
 
+def _print_retrieval(docs_scores, used_docs, max_chars=400):
+    print("\n" + "="*60)
+    print("[RAG] RETRIEVED (top results before filtering):")
+    for i, (d, sc) in enumerate(docs_scores[:10], 1):
+        meta = d.metadata or {}
+        src = meta.get("source_url") or meta.get("local_path") or meta.get("source") or "unknown"
+        dt  = meta.get("doc_type") or "NONE"
+        snippet = (d.page_content or "").replace("\n", " ")
+        print(f"  ({i}) score={sc} | doc_type={dt} | src={src}")
+        print(f"      {snippet[:max_chars]}{'...' if len(snippet) > max_chars else ''}")
+
+    print("\n[RAG] USED IN PROMPT (after filtering/top_k):")
+    for i, d in enumerate(used_docs, 1):
+        meta = d.metadata or {}
+        src = meta.get("source_url") or meta.get("local_path") or meta.get("source") or "unknown"
+        dt  = meta.get("doc_type") or "NONE"
+        snippet = (d.page_content or "").replace("\n", " ")
+        print(f"  [{i}] doc_type={dt} | src={src}")
+        print(f"      {snippet[:max_chars]}{'...' if len(snippet) > max_chars else ''}")
+    print("="*60 + "\n")
+
+
 # --- Load app_gradio_rag_only directly from BrainTumorChatbot -----------------
 
 PROJECT_DIR = Path(__file__).resolve().parent        # C:\Fatima_Final_Bot\MultimodalAssistant
@@ -31,6 +53,8 @@ _bt_rag_module = SourceFileLoader(
     "bt_app_gradio_rag_only", str(APP_RAG_PATH)
 ).load_module()
 
+_bt_rag_module._print_retrieval = _print_retrieval 
+
 rag_answer = _bt_rag_module.answer  # function from the original app
 
 
@@ -38,27 +62,52 @@ rag_answer = _bt_rag_module.answer  # function from the original app
 
 def _audience_prefix(audience: str) -> str:
     """
-    Build an audience-specific instruction prefix that will be included
+    Build a audience-specific prefix that  will be included
     in the question text passed to the RAG pipeline.
+    The detailed behaviour, safety rules and style are handled in
+    app_gradio_rag_only._build_prompt().
     """
     a = (audience or "").strip().lower()
+
     if a.startswith("clin"):
         # Clinician-facing
         return (
-            "You are drafting a brief, clinically oriented explanation for a "
-            "neurosurgeon or neuro-oncologist. Use correct medical terminology. "
-            "Answer all parts of the question. Do not give patient-specific "
-            "treatment decisions or drug doses.\n\n"
+            # "This question is from a CLINICIAN "
+            # "(e.g. radiologist, neurosurgeon, oncologist, or trainee). "
+            # "They are comfortable with technical medical language and guideline-style discussion.\n\n"
+            "This question is from a CLINICIAN (e.g. neurosurgeon, neuro-oncologist, "
+            "neuroradiologist or trainee). Please give a concise but informative, "
+            "clinically oriented explanation.\n\n"
+            "- Use correct medical terminology and guideline-style language.\n"
+            "- Start by briefly stating the MOST LIKELY tumour type and typical "
+            "anatomical location, based on the documents and any information given.\n"
+            "- Then summarise: usual clinical presentation / key symptoms, important "
+            "imaging and pathology work-up, and standard management options "
+            "(surgery, radiotherapy, systemic / endocrine treatments, monitoring).\n"
+            "- You may mention relevant guideline-style phrases if the context supports "
+            "them (for example WHO grade, IDH status, EANO / NCCN style wording).\n"
+            "- Do NOT invent drug doses or give patient-specific treatment decisions; "
+            "keep recommendations general and emphasise that final decisions are made "
+            "by the treating team.\n\n"
         )
     else:
         # Patient-facing by default
         return (
-            "You are explaining this to a patient or family member with no "
-            "medical background. Use clear, simple language and a reassuring tone. "
-            "Answer every part of the question. Do NOT give a firm diagnosis or "
-            "tell them exactly which treatment they must have; speak in general "
-            "terms and encourage them to discuss details with their doctors.\n\n"
+            "This question is from a PATIENT or FAMILY MEMBER with no medical background. "
+            "Please answer in clear, simple, reassuring language and explain medical terms in everyday words.\n\n"
+            "- Begin with 1–2 sentences that gently explain what this tumour type is "
+            "and where it usually occurs in the brain.\n"
+            "- Then describe, in everyday words, the common symptoms people might "
+            "notice and the usual tests doctors do (for example MRI or CT scans, "
+            "blood tests, or biopsy).\n"
+            "- Explain the typical treatment OPTIONS in general terms (such as "
+            "surgery, radiotherapy, medicines or careful monitoring) without telling "
+            "the person exactly which treatment they personally must have.\n"
+            "- Avoid frightening language; be honest but balanced. Make it clear that "
+            "any scanner / AI suggestion is only a POSSIBLE tumour type, not a final "
+            "diagnosis, and that they must discuss details with their own doctors.\n\n"
         )
+        
 
 
 
@@ -95,12 +144,13 @@ def run_rag(question: str, audience: str = "patient", top_k: int = 5) -> Dict[st
             "dbg": "Empty question.",
         }
 
-    pref = _audience_prefix(audience)
-    full_question = pref + question
-
-    # BrainTumorChatbot.app_gradio_rag_only.answer
+    # NOTE: We NO LONGER prepend audience prefix here!
+    # The audience parameter is now passed directly to the RAG function
+    # so _build_prompt() can handle it properly
+    
+    # BrainTumorChatbot.app_gradio_rag_only.answer now takes audience parameter
     text, sources, prompt, context_debug, raw_text, dbg = rag_answer(
-        full_question, top_k
+        question, top_k, audience  # <-- Pass audience as 3rd parameter
     )
 
     return {
