@@ -1,117 +1,136 @@
 # core_classifier.py
-# Wrapper around BRISC2025 classifier from BrainTumorChatbot/app_brisc_segaware.py
+# Wrap BRISC classifier + segmentation into a safe function for the Gradio app.
 
-import json, sys
-from importlib.machinery import SourceFileLoader
-from pathlib import Path
-from typing import Any, Dict, Optional
+import os
+import sys
+import json
+import re
+from typing import Any, Dict
 
-from PIL import Image
+# --- Make BrainTumorChatbot importable ---
+# Adjust this path if your folder name differs
+BRAINBOT_ROOT = r"C:\Fatima_Final_Bot\BrainTumorChatbot"
+if BRAINBOT_ROOT not in sys.path:
+    sys.path.insert(0, BRAINBOT_ROOT)
 
-
-# --- Load app_brisc_segaware directly from BrainTumorChatbot -----------------
-
-PROJECT_DIR = Path(__file__).resolve().parent        # C:\Fatima_Final_Bot\MultimodalAssistant
-ROOT_DIR = PROJECT_DIR.parent                   # C:\Fatima_Final_Bot
-BRAIN_CHATBOT_DIR = ROOT_DIR / "BrainTumorChatbot"   # C:\Fatima_Final_Bot\BrainTumorChatbot
-
-if not BRAIN_CHATBOT_DIR.is_dir():
-    raise FileNotFoundError(
-        f"Expected BrainTumorChatbot folder at {BRAIN_CHATBOT_DIR}, but it was not found."
+# Import your BRISC helper (this must exist in BrainTumorChatbot)
+try:
+    from app_brisc_segaware import classify_brisc_segaware, BRISC_CLS_PT, BRISC_SEG_PT, LABELS
+except Exception as e:
+    raise RuntimeError(
+        f"Could not import BRISC pipeline from BrainTumorChatbot.\n"
+        f"Check that app_brisc_segaware.py exists and is importable.\n"
+        f"Error: {type(e).__name__}: {e}"
     )
 
-# Make sure imports like 'import utils' work inside that project
-if str(BRAIN_CHATBOT_DIR) not in sys.path:
-    sys.path.insert(0, str(BRAIN_CHATBOT_DIR))
+def _to_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
-APP_BRISC_PATH = BRAIN_CHATBOT_DIR / "app_brisc_segaware.py"
-
-if not APP_BRISC_PATH.is_file():
-    raise FileNotFoundError(
-        f"Expected app_brisc_segaware.py at {APP_BRISC_PATH}, but it was not found."
-    )
-
-# Load the module from its file path with a unique name
-_bt_cls_module = SourceFileLoader(
-    "bt_app_brisc_segaware", str(APP_BRISC_PATH)
-).load_module()
-
-# This should exist in that file
-classify_brisc_segaware = _bt_cls_module.classify_brisc_segaware
-
-
-# --- Public API -----------------------------------------------------------------
-
-def run_classifier(image: Optional[Image.Image]) -> Dict[str, Any]:
+def run_classifier(image) -> Dict[str, Any]:
     """
-    Run the BRISC seg-aware classifier and return a structured result.
-
-    Parameters
-    ----------
-    image : PIL.Image.Image or None
-        MRI slice as a PIL image. If None, returns a "no image" result.
-
-    Returns
-    -------
-    dict with keys:
-        - raw_label: str
-        - adjusted_label: str
-        - confidence: float (probability of adjusted_label, if available)
-        - probs: dict[label -> float]
-        - overlay: PIL.Image.Image or None
-        - explanation: str (human-readable debug/explain text)
+    Returns:
+      adjusted_label: one of {glioma, meningioma, pituitary, no_tumor}
+      confidence: top1 probability (0..1)
+      status: confident | low_confidence | uncertain | error
+      probs: dict(label -> prob)
+      overlay: PIL image or None
+      explanation: text for UI
     """
+    # Always define locals so we never crash on partial failures
+    raw_label = "unknown"
+    adjusted_label = "unknown"
+    probs_dict: Dict[str, float] = {}
+    overlay = None
+    dbg_text = ""
+    status = "error"
+    top1_label, top2_label = None, None
+    top1_prob, top2_prob = 0.0, 0.0
+
     if image is None:
         return {
-            "raw_label": "no_image",
             "adjusted_label": "no_image",
             "confidence": 0.0,
+            "status": "error",
             "probs": {},
             "overlay": None,
-            "explanation": "No image provided.",
+            "explanation": "No MRI image provided, classifier not run.",
         }
 
-    # From BrainTumorChatbot/app_brisc_segaware.py:
-    #   raw_label, adjusted_label, probs_json, overlay_img, dbg_text
-    raw_label, adjusted_label, probs_json, overlay_img, dbg_text = classify_brisc_segaware(
-        image
-    )
-
-    # Parse probabilities JSON
-    probs_dict = {}
+    # --- Run BRISC pipeline safely ---
     try:
-        if isinstance(probs_json, str):
+        # Expected: raw_label, adjusted_label, probs_json, overlay_img, dbg_text
+        raw_label, adjusted_label, probs_json, overlay, dbg_text = classify_brisc_segaware(image)
+    except Exception as e:
+        return {
+            "adjusted_label": "error",
+            "confidence": 0.0,
+            "status": "error",
+            "probs": {},
+            "overlay": None,
+            "explanation": f"[Classifier ERROR] {type(e).__name__}: {e}",
+        }
+
+    # --- Parse probabilities safely ---
+    try:
+        if isinstance(probs_json, str) and probs_json.strip():
             probs_dict = json.loads(probs_json)
         elif isinstance(probs_json, dict):
             probs_dict = probs_json
+        else:
+            probs_dict = {}
     except Exception:
         probs_dict = {}
 
-    # Confidence = probability of adjusted_label if available
-    confidence = 0.0
-    if isinstance(probs_dict, dict) and adjusted_label in probs_dict:
-        try:
-            confidence = float(probs_dict[adjusted_label])
-        except Exception:
-            confidence = 0.0
+    # Normalize / float-cast
+    probs_dict = {k: _to_float(v, 0.0) for k, v in (probs_dict or {}).items()}
 
-    expl_lines = [
-        f"Raw label: {raw_label}",
-        f"Adjusted label: {adjusted_label}",
-        f"Confidence (adjusted label): {confidence:.3f}",
-        "Probabilities:",
-        json.dumps(probs_dict, indent=2),
-        "",
-        "Debug / guard details:",
-        dbg_text or "(no debug info)",
-    ]
-    explanation_text = "\n".join(expl_lines)
+    # Sort
+    sorted_probs = sorted(probs_dict.items(), key=lambda x: x[1], reverse=True)
+    if sorted_probs:
+        top1_label, top1_prob = sorted_probs[0]
+    if len(sorted_probs) >= 2:
+        top2_label, top2_prob = sorted_probs[1]
+
+    # Strip any prefixes if your downstream code added them before
+    base_adjusted = re.sub(r"^(uncertain_|low_confidence_)", "", (adjusted_label or "").strip().lower())
+    base_adjusted = base_adjusted or (top1_label or "unknown")
+
+    # --- Decide status ---
+    # You can tweak these thresholds
+    GAP_TH = 0.15
+    LOW_TH = 0.60
+
+    status = "confident"
+    if top1_prob < LOW_TH:
+        status = "low_confidence"
+    if top2_label is not None and (top1_prob - top2_prob) < GAP_TH:
+        # "uncertain" wins over low_confidence only if you prefer;
+        # if you want low_confidence to dominate, swap ordering.
+        status = "uncertain" if top1_prob >= LOW_TH else "low_confidence"
+
+    # --- Build explanation for UI ---
+    lines = []
+    lines.append(f"Raw label: {raw_label}")
+    lines.append(f"Adjusted label: {base_adjusted}")
+    lines.append(f"Confidence (top prediction): {top1_prob:.3f}")
+    if top2_label is not None:
+        lines.append(f"Runner-up: {top2_label} ({top2_prob:.3f}), gap={top1_prob - top2_prob:.3f}")
+    lines.append(f"Status: {status}")
+    if probs_dict:
+        lines.append("All Probabilities:\n" + json.dumps(probs_dict, indent=2))
+    if dbg_text:
+        lines.append("\nDebug / guard details:\n" + str(dbg_text))
+
+    explanation_text = "\n".join(lines)
 
     return {
-        "raw_label": raw_label,
-        "adjusted_label": adjusted_label,
-        "confidence": confidence,
+        "adjusted_label": base_adjusted,
+        "confidence": float(top1_prob),
+        "status": status,
         "probs": probs_dict,
-        "overlay": overlay_img,
+        "overlay": overlay,
         "explanation": explanation_text,
     }
