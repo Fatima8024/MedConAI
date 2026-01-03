@@ -31,6 +31,10 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from tqdm.auto import tqdm
 
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+
 from utils.config import load_cfg
 from data.loader_registry import get_loader
 
@@ -198,6 +202,221 @@ def load_checkpoint_if_exists(model, optimizer, scheduler):
     )
     return start_epoch, best_acc, best_state
 
+# ---------------- Calibration helpers ----------------
+
+class TemperatureScaler(nn.Module):
+    """
+    Simple temperature scaling module for post-hoc calibration.
+    """
+    def __init__(self):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.ones(1))
+
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        temp = self.temperature.clamp(min=1e-3)
+        return logits / temp
+
+
+def fit_temperature(model: nn.Module, loader: DataLoader, device: torch.device) -> TemperatureScaler:
+    """
+    Fit a temperature parameter on a held-out validation set
+    by minimising cross-entropy (NLL), as in Guo et al. 2017.
+    """
+    model.eval()
+    logits_list = []
+    labels_list = []
+
+    with torch.no_grad():
+        for x, y in tqdm(loader, desc="Calib [collect]", leave=False):
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            logits_list.append(logits)
+            labels_list.append(y)
+
+    logits = torch.cat(logits_list)   # (N, C)
+    labels = torch.cat(labels_list)   # (N,)
+
+    scaler = TemperatureScaler().to(device)
+    nll_criterion = nn.CrossEntropyLoss()
+    optimizer = optim.LBFGS([scaler.temperature], lr=0.01, max_iter=50)
+
+    def _eval():
+        optimizer.zero_grad()
+        scaled_logits = scaler(logits)
+        loss = nll_criterion(scaled_logits, labels)
+        loss.backward()
+        return loss
+
+    optimizer.step(_eval)
+    print(f"[CALIB] Fitted temperature: {scaler.temperature.item():.4f}")
+    return scaler
+
+
+def compute_ece(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 15) -> float:
+    """
+    Expected Calibration Error (ECE) for multi-class classification.
+    """
+    probs = probs.detach().cpu()
+    labels = labels.detach().cpu()
+
+    confidences, predictions = probs.max(dim=1)
+    accuracies = (predictions == labels).float()
+
+    confidences = confidences.numpy()
+    accuracies = accuracies.numpy()
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    ece = 0.0
+    n = len(confidences)
+
+    for i in range(n_bins):
+        in_bin = (confidences > bin_edges[i]) & (confidences <= bin_edges[i+1])
+        if not np.any(in_bin):
+            continue
+        bin_conf = confidences[in_bin].mean()
+        bin_acc = accuracies[in_bin].mean()
+        ece += (in_bin.sum() / n) * abs(bin_acc - bin_conf)
+
+    return float(ece)
+
+
+def compute_brier(probs: torch.Tensor, labels: torch.Tensor) -> float:
+    """
+    Brier score using probability of the true class.
+    Lower is better.
+    """
+    probs = probs.detach().cpu()
+    labels = labels.detach().cpu()
+    p_true = probs[torch.arange(len(labels)), labels]
+    brier = torch.mean((p_true - 1.0) ** 2).item()
+    return brier
+
+
+def reliability_bins(probs: torch.Tensor, labels: torch.Tensor, n_bins: int = 10):
+    """
+    Compute (bin_confidence, bin_accuracy) pairs for a reliability diagram.
+    """
+    probs = probs.detach().cpu()
+    labels = labels.detach().cpu()
+
+    confidences, predictions = probs.max(dim=1)
+    accuracies = (predictions == labels).float()
+
+    confidences = confidences.numpy()
+    accuracies = accuracies.numpy()
+
+    bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+    bin_conf = np.zeros(n_bins)
+    bin_acc = np.zeros(n_bins)
+
+    for i in range(n_bins):
+        in_bin = (confidences > bin_edges[i]) & (confidences <= bin_edges[i+1])
+        if not np.any(in_bin):
+            bin_conf[i] = np.nan
+            bin_acc[i] = np.nan
+        else:
+            bin_conf[i] = confidences[in_bin].mean()
+            bin_acc[i] = accuracies[in_bin].mean()
+
+    return bin_conf, bin_acc
+
+
+def evaluate_calibration_and_plot(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    export_dir: str,
+    n_bins: int = 10,
+):
+    """
+    Compute ECE/Brier before and after temperature scaling and
+    save reliability diagrams as a PNG.
+    """
+    model.eval()
+
+    # Collect logits/labels
+    logits_list = []
+    labels_list = []
+    with torch.no_grad():
+        for x, y in tqdm(loader, desc="Calib [eval]", leave=False):
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            logits_list.append(logits)
+            labels_list.append(y)
+
+    logits = torch.cat(logits_list)
+    labels = torch.cat(labels_list)
+
+    # Uncalibrated probabilities
+    probs_uncal = F.softmax(logits, dim=1)
+
+    # Fit temperature
+    scaler = TemperatureScaler().to(device)
+    # reuse logits/labels to fit T
+    nll_criterion = nn.CrossEntropyLoss()
+    optimizer = optim.LBFGS([scaler.temperature], lr=0.01, max_iter=50)
+
+    def _eval():
+        optimizer.zero_grad()
+        scaled_logits = scaler(logits)
+        loss = nll_criterion(scaled_logits, labels)
+        loss.backward()
+        return loss
+
+    optimizer.step(_eval)
+    print(f"[CALIB] Fitted temperature (within eval): {scaler.temperature.item():.4f}")
+
+    # Calibrated probabilities
+    scaled_logits = scaler(logits)
+    probs_cal = F.softmax(scaled_logits, dim=1)
+
+    # ECE and Brier
+    ece_uncal = compute_ece(probs_uncal, labels, n_bins=n_bins)
+    ece_cal = compute_ece(probs_cal, labels, n_bins=n_bins)
+    brier_uncal = compute_brier(probs_uncal, labels)
+    brier_cal = compute_brier(probs_cal, labels)
+
+    print(f"[CALIB] ECE: uncalibrated={ece_uncal:.4f}, calibrated={ece_cal:.4f}")
+    print(f"[CALIB] Brier: uncalibrated={brier_uncal:.4f}, calibrated={brier_cal:.4f}")
+
+    # Reliability bins
+    bin_conf_u, bin_acc_u = reliability_bins(probs_uncal, labels, n_bins=n_bins)
+    bin_conf_c, bin_acc_c = reliability_bins(probs_cal, labels, n_bins=n_bins)
+
+    # Plot reliability diagrams (before/after)
+    plt.figure(figsize=(10, 4))
+
+    # Before
+    plt.subplot(1, 2, 1)
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.plot(bin_conf_u, bin_acc_u, marker="o")
+    plt.xlabel("Predicted confidence")
+    plt.ylabel("Empirical accuracy")
+    plt.title("Before temperature scaling")
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+
+    # After
+    plt.subplot(1, 2, 2)
+    plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    plt.plot(bin_conf_c, bin_acc_c, marker="o")
+    plt.xlabel("Predicted confidence")
+    plt.ylabel("Empirical accuracy")
+    plt.title("After temperature scaling")
+    plt.xlim(0, 1)
+    plt.ylim(0, 1)
+
+    plt.tight_layout()
+    out_path = os.path.join(export_dir, "reliability_brisc.png")
+    plt.savefig(out_path, dpi=300)
+    plt.close()
+    print(f"[CALIB] Saved reliability diagram -> {out_path}")
+
+    return (ece_uncal, ece_cal, brier_uncal, brier_cal)
+
+
 
 # ---------------- Main training ----------------
 
@@ -286,6 +505,23 @@ def main():
     if best_state is not None:
         model.load_state_dict(best_state)
     model.eval()
+
+     # ---- Calibration and reliability diagram on validation set ----
+    try:
+        ece_u, ece_c, brier_u, brier_c = evaluate_calibration_and_plot(
+            model,
+            val_loader,
+            DEVICE,
+            EXPORT_DIR,
+            n_bins=10,
+        )
+        print(
+            f"[CALIB] Summary: ECE {ece_u:.4f} -> {ece_c:.4f}, "
+            f"Brier {brier_u:.4f} -> {brier_c:.4f}"
+        )
+    except Exception as e:
+        print(f"[CALIB] Skipped calibration/reliability due to error: {e}")
+
 
     # Dummy input based on configured input size
     h, w = CFG.preproc.input_size
