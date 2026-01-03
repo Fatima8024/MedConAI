@@ -7,6 +7,13 @@ from transformers.utils.logging import set_verbosity_error
 set_verbosity_error()
 logging.getLogger("transformers").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
+from openai import AzureOpenAI
+from dotenv import load_dotenv
+load_dotenv() 
+from pathlib import Path
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
 
 from langchain_community.vectorstores import FAISS
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -27,7 +34,9 @@ except ImportError:
 BASE = os.path.dirname(os.path.abspath(__file__))
 
 # FAISS index dir (built by brain_tumor_corpus.py)
-RAG_DIR = os.getenv("RAG_DIR", os.path.join(BASE, "corpus", "rag_index"))
+RAG_DIR = os.getenv("RAG_DIR", os.path.join(BASE, "corpus", "rag_index_evidence"))
+
+#RAG_DIR = "C:\Fatima_Final_Bot\BrainTumorChatbot\corpus\rag_index_evidence"
 
 # LoRA finetuned adapters directory
 LOCAL_FINETUNE_DIR = os.path.join(BASE, "models", "flan_t5_brain_qa")
@@ -39,18 +48,36 @@ DEFAULT_LLM_ID = "google/flan-t5-large"
 # Embedding model
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 
-# Generation / RAG params
-MAX_NEW_TOK = 64
+AZURE_ENDPOINT = os.getenv("AZURE_ENDPOINT", "https://fatimagpt.cognitiveservices.azure.com/")
+AZURE_API_KEY = os.getenv("AZURE_API_KEY", "")
+AZURE_API_VERSION = os.getenv("AZURE_API_VERSION", "2024-12-01-preview")
+AZURE_DEPLOYMENT_NAME = os.getenv("AZURE_DEPLOYMENT_NAME", "o1")
+
+LLM_MODE = os.getenv("LLM_MODE", "azure")
+MAX_OUTPUT_TOKENS = int(os.getenv("MAX_OUTPUT_TOKENS", "2000"))
+
+
+
+# Token limits
+
+MAX_DOCS_FOR_CONTEXT = 4
+MAX_CHARS_PER_DOC = 1200
+
+# Legacy settings (for local model fallback)
+# Generation 
+MAX_NEW_TOK = 384
 MAX_INPUT_TOK = 512
 TOPK_DEFAULT = 3
 
 GEN_KWARGS = dict(
     max_new_tokens=MAX_NEW_TOK,
-    num_beams=6,
-    do_sample=False,
-    no_repeat_ngram_size=2,
-    repetition_penalty=1.2,
-    early_stopping=True,
+    num_beams=4,
+    do_sample=True,
+    no_repeat_ngram_size=3,
+    repetition_penalty=1.1,
+    #early_stopping=True,
+    temperature=0.7, 
+    top_p=0.9
 )
 
 # ================== GLOBALS ==================
@@ -58,6 +85,104 @@ _emb = None
 _vs = None
 _llm = None
 _tok = None
+_azure_client = None
+
+# STEP 3: Add these NEW FUNCTIONS for Azure OpenAI
+# ============================================================================
+
+def _init_azure():
+    """Initialize Azure OpenAI client"""
+    global _azure_client
+    if _azure_client is None:
+        if not AZURE_API_KEY or AZURE_API_KEY == "<your-api-key>":
+            raise ValueError(
+                "Azure API key not set! Please set AZURE_API_KEY in the config section."
+            )
+        
+        _azure_client = AzureOpenAI(
+            api_version=AZURE_API_VERSION,
+            azure_endpoint=AZURE_ENDPOINT,
+            api_key=AZURE_API_KEY,
+        )
+        print(f"[LLM] ✓ Azure OpenAI initialized successfully")
+        print(f"[LLM] Endpoint: {AZURE_ENDPOINT}")
+        print(f"[LLM] Deployment: {AZURE_DEPLOYMENT_NAME}")
+    
+    return _azure_client
+
+
+def _build_prompt_azure(question: str, docs, audience: str = "Patient") -> tuple:
+    """Build system and user prompts for Azure OpenAI."""
+    
+    is_clinician = (audience or "").strip().lower().startswith("clin")
+    
+    if is_clinician:
+        system_prompt = """Medical AI for healthcare professionals. Provide evidence-based responses with medical terminology covering: tumor type/location, symptoms, diagnostics, treatments. Keep general; specifics determined by treating team."""
+    else:
+        system_prompt = """Medical AI helping patients understand brain tumors. Use simple language. Cover: what tumor is, where it grows, symptoms, tests, treatments. Clarify AI predictions aren't final diagnoses."""
+
+    # Build context
+    docs = list(docs)[:MAX_DOCS_FOR_CONTEXT]
+    context_parts = []
+    
+    for i, doc in enumerate(docs, 1):
+        content = (doc.page_content or "").strip()
+        if content:
+            truncated = content[:MAX_CHARS_PER_DOC]
+            context_parts.append(f"[{i}] {truncated}")
+    
+    context = "\n\n".join(context_parts) if context_parts else "No relevant information found."
+    
+    user_prompt = f"""Context: {context}
+
+Q: {question}
+
+Provide a complete answer (6-8 sentences)."""
+
+    return system_prompt, user_prompt
+
+
+def _call_azure(system_prompt: str, user_prompt: str, audience: str) -> str:
+    """Call Azure OpenAI API."""
+    client = _init_azure()
+    
+    try:
+        response = client.chat.completions.create(
+            model=AZURE_DEPLOYMENT_NAME,  # ← Uses your deployment name
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            reasoning_effort="low", 
+            max_completion_tokens=MAX_OUTPUT_TOKENS,  # ← Note: max_completion_tokens for Azure
+        )
+        
+        # Log usage
+        usage = response.usage
+        print(f"[AZURE] Tokens - Prompt: {usage.prompt_tokens}, Completion: {usage.completion_tokens}, Total: {usage.total_tokens}")
+        
+        # Azure o1 pricing (adjust if using different model)
+        # o1 is expensive: ~$15/1M prompt tokens, ~$60/1M completion tokens
+        cost = (usage.prompt_tokens * 15 + usage.completion_tokens * 60) / 1_000_000
+        print(f"[AZURE] Estimated cost: ${cost:.6f}")
+        
+        text = response.choices[0].message.content
+        text = (text or "").strip()
+
+        if not text:
+            # fall back so UI never stays blank
+            text = (
+                "I couldn't generate a complete answer within the current token limit. "
+                "Please try again, or increase MAX_OUTPUT_TOKENS."
+            )
+
+        return text
+
+               
+    except Exception as e:
+        print(f"[AZURE ERROR] {type(e).__name__}: {e}")
+        return f"Azure OpenAI API Error: {str(e)}\nPlease check your API key and endpoint."
+
 
 # ================== HELPERS ==================
 
@@ -74,6 +199,8 @@ def _init_embeddings():
 
 def _load_index(rag_dir: str):
     global _vs
+
+    print("[RAG] Loading index from:", rag_dir)  
     emb = _init_embeddings()
     faiss_path = os.path.join(rag_dir, "index.faiss")
     pkl_path = os.path.join(rag_dir, "index.pkl")
@@ -88,48 +215,55 @@ def _load_index(rag_dir: str):
     return (
         f"Loaded index (ntotal={_vs.index.ntotal}, dim={_vs.index.d})\n"
         f"index.faiss: {m1}\nindex.pkl:   {m2}"
+
     )
 
 
 def _load_llm():
-    """
-    Load answer LLM.
-    """
+    """Load LLM - Azure OpenAI or local model based on LLM_MODE."""
     global _llm, _tok
+    
+    if LLM_MODE == "azure":
+        print("[LLM] Mode: Azure OpenAI")
+        _init_azure()
+        return None
+    
+    # Local model fallback (same as before)
     if _llm is not None:
         return _llm
     
-    use_lora = False
-
-    # use_lora = (
-    #     os.path.isdir(LOCAL_FINETUNE_DIR)
-    #     and os.path.exists(os.path.join(LOCAL_FINETUNE_DIR, "adapter_config.json"))
-    #     and os.path.exists(os.path.join(LOCAL_FINETUNE_DIR, "adapter_model.safetensors"))
-    #     and PEFT_AVAILABLE
-    # )
+    print("[LLM] Mode: Local model (LoRA or base)")
+    
+    try:
+        from peft import PeftModel
+        PEFT_AVAILABLE = True
+    except ImportError:
+        PEFT_AVAILABLE = False
+    
+    use_lora = (
+        LLM_MODE == "lora"
+        and PEFT_AVAILABLE
+        and os.path.isdir(LOCAL_FINETUNE_DIR)
+        and os.path.exists(os.path.join(LOCAL_FINETUNE_DIR, "adapter_config.json"))
+    )
 
     if use_lora:
-        print(f"[LLM] Loading base {BASE_LLM_ID} with LoRA from {LOCAL_FINETUNE_DIR}")
+        print(f"[LLM] Loading LoRA model from {LOCAL_FINETUNE_DIR}")
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Text2TextGenerationPipeline
         base_model = AutoModelForSeq2SeqLM.from_pretrained(BASE_LLM_ID)
         lora_model = PeftModel.from_pretrained(base_model, LOCAL_FINETUNE_DIR)
         model = lora_model.merge_and_unload()
         _tok = AutoTokenizer.from_pretrained(BASE_LLM_ID, use_fast=True)
     else:
-        target = os.getenv("LLM_MODEL_ID", DEFAULT_LLM_ID)
-        print(f"[LLM] Loading base model without LoRA: {target}")
-        model = AutoModelForSeq2SeqLM.from_pretrained(target)
-        _tok = AutoTokenizer.from_pretrained(target, use_fast=True)
-    # Set tokenizer limits
-    _tok.model_max_length = MAX_INPUT_TOK
+        print(f"[LLM] Loading base model: {DEFAULT_LLM_ID}")
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, Text2TextGenerationPipeline
+        model = AutoModelForSeq2SeqLM.from_pretrained(DEFAULT_LLM_ID)
+        _tok = AutoTokenizer.from_pretrained(DEFAULT_LLM_ID, use_fast=True)
+    
+    _tok.model_max_length = 512
     _tok.truncation_side = "left"
-
-    _llm = Text2TextGenerationPipeline(
-        model=model,
-        tokenizer=_tok,
-        device=-1,  # CPU
-        **GEN_KWARGS,
-    )
-    print(f"[LLM] Device set to CPU, max input tokens: {MAX_INPUT_TOK}")
+    _llm = Text2TextGenerationPipeline(model=model, tokenizer=_tok, device=-1, **GEN_KWARGS)
+    
     return _llm
 
 
@@ -193,147 +327,118 @@ def _clean_content(content: str) -> str:
     return clean_content
 
 
-def _is_qa_training_data(content: str) -> bool:
-    """Return True only for obvious multi-Q/A training shards - higher threshold."""
-    if not content:
-        return False
-    t = content.lower()
+# def _is_qa_training_data(content: str) -> bool:
+#     """Return True only for obvious multi-Q/A training shards - higher threshold."""
+#     if not content:
+#         return False
+#     t = content.lower()
 
-    # Count explicit Q/A labels - require more for flagging
-    q_count = t.count("q:") + t.count("question:")
-    a_count = t.count("a:") + t.count("answer:")
+#     # Count explicit Q/A labels - require more for flagging
+#     q_count = t.count("q:") + t.count("question:")
+#     a_count = t.count("a:") + t.count("answer:")
 
-    if (q_count + a_count) >= 4:  # Increased from 3
-        return True
+#     if (q_count + a_count) >= 10:  # Increased from 3
+#         return True
+#     bullet_count = len(re.findall(r'(?m)^\s*[•-]\s+', content))
+#     question_marks = t.count("?")
+#     return bullet_count >= 20 and question_marks >= 10
+#     # bullet_count = content.count("•") + content.count("-")
+#     # if bullet_count >= 15 and question_marks >= 8:  # Increased thresholds
+#     #     return True
 
-    question_marks = t.count("?")
-    # bullet_count = content.count("•") + content.count("-")
-    # if bullet_count >= 15 and question_marks >= 8:  # Increased thresholds
-    #     return True
-
-    # Count real bullets at line starts, not hyphens inside words
-    bullet_count = len(re.findall(r'(?m)^\s*[•-]\s+', content))
-    #question_marks = t.count("?")
-
-    # Only treat as QA if it's BOTH bullet-heavy AND question-heavy
-    return bullet_count >= 8 and question_marks >= 4
-    #return False
-
-
-def _build_prompt(question: str, docs, max_input_tokens: int = MAX_INPUT_TOK) -> str:
-    """
-    Build a clean, focused QA prompt that fits within token limits
-    """
-    instruction = (
-    "Imagine you are a brain tumor specialist and have knowledge about it. You know all the terminologies, what tests, scans, treatments are required,you know the symptoms and cure. Based on the medical context below and your knowledge, provide a logical, understandable answer in 1–3 sentences from the medical context. "
-    "Do not invent information. Do not include 'Q:' or 'A:' or bullet lists. "
-    #"If the information is not in the context, say \"I cannot find specific information about this in the available documents.\"\n\n"
-    "Context:\n{context}\n\n"
-    "Question: {question}\n\n"
-    "Answer:"
-    )
-
-
-    # Token budget for context
-    base_prompt = instruction.format(context="", question=question.strip())
-    base_tokens = _count_tokens(base_prompt)
-    available_tokens = max_input_tokens - base_tokens - 20
-    if available_tokens < 50:
-        available_tokens = 50
-
-    # Build context from cleaned docs
-    context_parts = []
-    current_tokens = 0
-    for i, d in enumerate(docs):
-        raw_content = (d.page_content or "").strip()
-        if _is_qa_training_data(raw_content):
-            continue
-
+#     # Count real bullets at line starts, not hyphens inside words
     
-        clean_content = _clean_content(raw_content)
-        if not clean_content:
+#     #question_marks = t.count("?")
+
+#     # Only treat as QA if it's BOTH bullet-heavy AND question-heavy
+    
+#     #return False
+
+def _build_prompt(question: str, docs, audience: str = "Patient", max_input_tokens: int = MAX_INPUT_TOK) -> str:
+    """
+    Build a very compact RAG prompt that fits in 512 tokens.
+    """
+    
+    is_clinician = (audience or "").strip().lower().startswith("clin")
+    
+    # VERY SHORT instructions
+    if is_clinician:
+        instruction = """Using CONTEXT below, answer clinically: (1) tumor type & location, (2) symptoms, (3) tests needed, (4) treatment options. Use medical terms. 6-8 sentences."""
+    else:
+        instruction = """Using CONTEXT below, answer in simple words: (1) what this tumor is & where it grows, (2) symptoms, (3) tests doctors do, (4) treatments available. Explain terms simply. 6-8 sentences."""
+
+    # Limit to 3 docs with smaller budget per doc
+    docs = list(docs)[:3]
+    context_lines = []
+    per_doc_budget = 70  # Reduced from 90
+
+    for i, doc in enumerate(docs, 1):
+        content = (doc.page_content or "").strip()
+        if not content:
             continue
+        snippet = _truncate_to_tokens(content, per_doc_budget)
+        if snippet:
+            context_lines.append(f"[{i}] {snippet}")
 
-        content_tokens = _count_tokens(clean_content)
-        if current_tokens + content_tokens > available_tokens:
-            remaining = available_tokens - current_tokens
-            if remaining > 20:
-                trunc = _truncate_to_tokens(clean_content, remaining)
-                if trunc:
-                    context_parts.append(f"[{i+1}] {trunc}")
-            break
+    context = "\n".join(context_lines) if context_lines else "No context."
 
-        context_parts.append(f"[{i+1}] {clean_content}")
-        current_tokens += content_tokens
+    # Ultra-compact structure
+    full_prompt = f"""{instruction}
 
-    if not context_parts:
-        # Fall back to longer raw snippets
-        avail = max_input_tokens - _count_tokens(instruction.format(context="", question=question.strip())) - 20
-        per_doc = max(32, avail // max(1, len(docs)))  # Increased min from 32
-        for i, d in enumerate(docs):
-            raw = (d.page_content or "").strip()
-            if not raw:
-                continue
-            snippet = _truncate_to_tokens(raw, per_doc)
-            if snippet:
-                context_parts.append(f"[{i+1}] {snippet}")
+CONTEXT:
+{context}
 
-    context = "\n\n".join(context_parts) if context_parts else "No relevant context found."
-    full_prompt = instruction.format(context=context, question=question.strip())
-    return _truncate_to_tokens(full_prompt, max_input_tokens)
+Q: {question.strip()}
 
-# def _extract_answer(text: str) -> str:
-#     DEFAULT = "I cannot find specific information about this in the available documents."
-#     if not text:
-#         return DEFAULT
+A:"""
 
-#     m = re.search(r'(?:^|\n)(?:answer:|a:)\s*(.*)$', text, flags=re.IGNORECASE | re.DOTALL)
-#     if m:
-#         text = m.group(1).strip()
+    total_tokens = _count_tokens(full_prompt)
+    print(f"[RAG DEBUG] Audience={audience} | Prompt tokens={total_tokens}/{max_input_tokens}")
 
-#     # Strip prompt echoes
-#     text = re.sub(r'(?im)^(?:context|question)\s*:\s*.*$', '', text).strip()
+    return full_prompt
 
-#     # Take the first 1–3 sentences that look declarative
-#     sentences = re.split(r'(?<=[.!?])\s+', text)
-#     picked = []
-#     for s in sentences:
-#         s = s.strip()
-#         if len(s) >= 8 and not s.lower().startswith(("context:", "question:", "based on", "according to")):
-#             picked.append(s)
-#         if len(picked) >= 3:
-#             break
-
-#     return (" ".join(picked)).strip() or DEFAULT
 
 def _extract_answer(text: str) -> str:
+    """
+    Extract clean answer from LLM output.
+    Handles prompt echoes, partial outputs, and formatting issues.
+    """
+    DEFAULT = "I cannot find specific information about this in the available documents."
+
+    text = (text or "").strip()
     if not text:
-        return "I cannot find specific information about this in the available documents."
+        return DEFAULT
 
-    # --- keep only what comes after the LAST "Answer:" or "A:" (case-insensitive) ---
-    m_last = None
-    for m in re.finditer(r'(?:^|\n)\s*(?:answer|a)\s*:\s*(.*)$', text, flags=re.IGNORECASE | re.DOTALL):
-        m_last = m
-    if m_last:
-        text = m_last.group(1).strip()
+    # If output starts with "A:" or "ANSWER:", take what comes after
+    if text.startswith(("A:", "A :", "ANSWER:", "Answer:")):
+        text = re.sub(r'^A\s*:\s*', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'^ANSWER\s*:\s*', '', text, flags=re.IGNORECASE)
+        text = text.strip()
 
-    # --- very light cleanup: only drop bullets that are questions ---
-    kept = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith(('•', '-')) and line.rstrip().endswith('?'):
-            continue
-        kept.append(line)
-
-    clean = ' '.join(kept).strip()
-    if not clean:
-        return "I cannot find specific information about this in the available documents."
-
-    # --- return the first 1–2 sentences ---
-    sentences = re.split(r'(?<=[.!?])\s+', clean)
-    return ' '.join(sentences[:2]).strip()
+    # Remove any context/question echoes
+    text = re.sub(r'(?i)^.*?(?:CONTEXT|QUESTION|Q)\s*:.*?(?=\n|$)', '', text, flags=re.MULTILINE)
+    
+    # Remove instruction echoes
+    instruction_patterns = [
+        r'(?i)using context below.*?(?:\.|$)',
+        r'(?i)answer (?:in simple words|clinically).*?(?:\.|$)',
+        r'(?i)MRI scan:.*?Not confirmed diagnosis\.',
+    ]
+    
+    for pattern in instruction_patterns:
+        text = re.sub(pattern, '', text)
+    
+    # Clean up
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    # If it's just the scan description echoed back, return default
+    if len(text) < 40 or text.lower().startswith('mri scan:'):
+        return DEFAULT
+    
+    # Remove any remaining formatting artifacts
+    text = text.replace('**', '').strip()
+    
+    return text or DEFAULT
 
 
 # ================== CORE ==================filtered_docs:
@@ -345,7 +450,12 @@ def on_load(rag_dir):
         return f"ERROR: {type(e).__name__}: {e}"
 
 
-def answer(question, top_k):
+# STEP 4: REPLACE the answer() function with this Azure-aware version
+# ============================================================================
+
+def answer(question, top_k, audience="Patient"):
+    """Main RAG answer function - uses Azure OpenAI or local model based on LLM_MODE."""
+
     question = (question or "").strip()
     if not question:
         return "", "", "", "", "", "Please type a question."
@@ -353,131 +463,111 @@ def answer(question, top_k):
     try:
         global _vs
 
-        # Ensure index + LLM are ready
-        status = None
         if _vs is None:
             status = _load_index(RAG_DIR)
-        _ = _load_llm()  # ensures global _llm/_tok are initialized
+
+        _ = _load_llm()
 
         # Retrieval
         k = min(int(top_k), 5) if top_k else TOPK_DEFAULT
         filtered_docs = []
-        docs_scores = []
-        mmr_docs = []
 
         try:
-            mmr_docs = _vs.max_marginal_relevance_search(
-                question, k=k, fetch_k=32, lambda_mult=0.3
-            )
-            docs_scores = _vs.similarity_search_with_score(question, k=max(k * 6, 24))
-        except Exception:
-            try:
-                docs_scores = _vs.similarity_search_with_score(question, k=max(k * 6, 24))
-            except TypeError:
-                base_docs = _vs.similarity_search(question, k=max(k * 6, 24))
-                docs_scores = [(d, None) for d in base_docs]
+            docs_scores = _vs.similarity_search_with_score(question, k=max(k * 4, 20))
+        except TypeError:
+            base_docs = _vs.similarity_search(question, k=max(k * 4, 20))
+            docs_scores = [(d, None) for d in base_docs]
 
-        # Guard: nothing retrieved at all
-        if not docs_scores and not mmr_docs:
-            return (
-                "I cannot find specific information about this in the available medical documents.",
-                "", "", "", "",
-                "Retriever returned 0 passages."
-            )
+        from collections import Counter
+        print("DOC TYPE COUNTS:", Counter(((d.metadata or {}).get("doc_type", "NONE") for d, _ in docs_scores)))
 
-        # Filter documents
+        if not docs_scores:
+            return ("No relevant information found.", "", "", "", "", "No retrieval results.")
+
+        # Filter (keep only evidence docs, skip qa_pair + unknown sources)
         for doc, score in docs_scores:
             content = (doc.page_content or "").strip()
             meta = doc.metadata or {}
 
+            doc_type = (meta.get("doc_type") or "").lower()
             source = (meta.get("source") or "").lower()
-            if "qa_jsonl" in source or "qa_json" in source:
+            qa_source = (meta.get("qa_source") or "").lower()
+
+            # Skip synthetic QA pairs
+            if doc_type == "qa_pair":
                 continue
-            if _is_qa_training_data(content):
+
+            # Skip anything with unknown/empty source
+            if source in ("", "unknown"):
                 continue
-            if len(content) < 25:
+
+            # Old filter (optional)
+            if "qa_jsonl" in source or "qa_json" in source or "qa_jsonl" in qa_source:
                 continue
 
             filtered_docs.append(doc)
             if len(filtered_docs) >= k:
                 break
 
-        # Fallbacks
-        if not filtered_docs and docs_scores:
-            filtered_docs = [d for d, _ in docs_scores[:max(1, k)]]
-        if not filtered_docs and mmr_docs:
-            filtered_docs = mmr_docs[:max(1, k)]
+        # IMPORTANT: do NOT fall back to QA silently
         if not filtered_docs:
             return (
-                "I cannot find specific information about this in the available medical documents.",
+                "No evidence documents found in retrieval (only qa_pair chunks were returned).",
                 "", "", "", "",
-                "No relevant passages after filtering."
+                "No non-QA sources available. Rebuild/load the evidence index."
             )
 
-        # Build prompt and generate
-        prompt = _build_prompt(question, filtered_docs)
-        inputs = _llm.tokenizer(
-            prompt,
-            return_tensors="pt",
-            truncation=True,
-            max_length=MAX_INPUT_TOK,
-            add_special_tokens=True,
-        )
-        outputs = _llm.model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOK,
-            num_beams=4,
-            do_sample=False,
-            no_repeat_ngram_size=3,
-            repetition_penalty=1.1,
-            early_stopping=True,
-        )
-        raw_text = _llm.tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+        # ✅ ADD THIS BLOCK HERE (RAG vs USED)
+        used_docs = filtered_docs[:k]
+        try:
+            _print_retrieval(docs_scores, used_docs)
+        except Exception:
+            pass
 
-        # Keep only content after "Answer:" or "A:" if present
-        m = re.search(r'(?:^|\n)(?:answer|a)\s*:\s*(.*)$', raw_text,
-                      flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            raw_text = m.group(1).strip()
+        print(f"[RAG] Retrieved {len(docs_scores)} docs, using {len(filtered_docs)} | Mode: {LLM_MODE} | Audience: {audience}")
+        print("META SAMPLE:", (filtered_docs[0].metadata if filtered_docs else None))
 
-        text = _extract_answer(raw_text)
+        # Generation
+        if LLM_MODE == "azure":
+            system_prompt, user_prompt = _build_prompt_azure(question, filtered_docs, audience)
 
-        # Fallback: if the model hedged but the context plainly contains statements,
-        # use the first 1–2 sentences from the context we actually sent.
-        if not text or text.lower().startswith("i cannot find"):
-         # the same slice you show in "Context Used (Debug)"
-            context_debug = prompt.split("Context:")[1].split("Question:")[0].strip() if "Context:" in prompt else ""
-            if context_debug:
-                    ctx_sents = re.split(r'(?<=[.!?])\s+', context_debug)
-                    ctx_pick = [s.strip() for s in ctx_sents if len(s.strip()) > 20][:2]
-                    if ctx_pick:
-                        text = " ".join(ctx_pick)
+            raw_text = _call_azure(system_prompt, user_prompt, audience)  # raw from model
+            text = _extract_answer(raw_text)  # cleaned + default if empty
 
+            prompt_debug = f"SYSTEM:\n{system_prompt}\n\nUSER:\n{user_prompt}"
+
+            print(f"\n{'='*60}")
+            print(f"AZURE ANSWER ({audience}) RAW:\n{raw_text}")
+            print(f"\nCLEANED:\n{text}")
+            print('='*60)
+
+        else:
+            # Local model path
+            prompt_debug = _build_prompt_local(question, filtered_docs, audience)
+            result = _llm(prompt_debug, max_new_tokens=200, min_length=60)
+            raw_text = result[0]['generated_text'] if result else ""
+            text = _extract_answer(raw_text)
 
         # Sources
         src_lines = []
         for i, d in enumerate(filtered_docs, 1):
             meta = d.metadata or {}
-            src = (meta.get("source_url") or meta.get("local_path")
-                   or meta.get("source") or "")
-            if src and "qa_jsonl" not in src.lower() and "qa_json" not in src.lower():
+            src = meta.get("source_url") or meta.get("local_path") or meta.get("source") or "unknown"
+            if "qa_jsonl" not in src.lower():
                 src_lines.append(f"[{i}] {src}")
-        sources = "\n".join(src_lines) if src_lines else "(source information not available)"
 
-        # Debug fields
-        context_debug = (
-            prompt.split("Context:")[1].split("Question:")[0].strip()
-            if "Context:" in prompt else "No context"
-        )
-        prompt_tokens = _count_tokens(prompt)
-        dbg = status or f"OK | used {len(filtered_docs)} passages | prompt tokens: {prompt_tokens}/{MAX_INPUT_TOK}"
+        sources = "\n".join(src_lines) if src_lines else "(no sources)"
+        context_debug = "\n\n".join([f"[{i}] {d.page_content[:1500]}..." for i, d in enumerate(filtered_docs, 1)])
+        dbg = f"OK | Mode: {LLM_MODE} | {len(filtered_docs)} docs | Audience: {audience}"
 
-        return text, sources, prompt, context_debug, raw_text, dbg
+        return text, sources, prompt_debug, context_debug, raw_text, dbg
 
     except Exception as e:
-        return "", "", "", "", "", f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        import traceback
+        return ("", "", "", "", "", f"ERROR: {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 # ================== UI ==================
+# Replace the existing Gradio UI section in app_gradio_rag_only.py
 
 with gr.Blocks(title="Brain Tumor RAG — Medical QA") as demo:
     gr.Markdown("## 🧠 Brain Tumor RAG — Medical QA")
@@ -491,18 +581,32 @@ with gr.Blocks(title="Brain Tumor RAG — Medical QA") as demo:
         lines=3,
         placeholder="e.g., What are the treatment options for brain tumors? What are the symptoms of glioma?",
     )
+    
+    # Add audience selector
+    audience_selector = gr.Radio(
+        ["Patient", "Clinician"],
+        value="Patient",
+        label="Audience (who is asking?)"
+    )
+    
     topk = gr.Slider(1, 5, value=TOPK_DEFAULT, step=1, label="Top-K passages")
     ask_btn = gr.Button("Answer", variant="primary")
 
     ans = gr.Textbox(label="Answer", lines=10)
     src = gr.Textbox(label="Sources", lines=6)
-    prompt_debug = gr.Textbox(label="Full Prompt (Debug)", lines=8)  # New
-    context_debug = gr.Textbox(label="Context Used (Debug)", lines=6)  # New
-    raw_output = gr.Textbox(label="Raw Model Output (Debug)", lines=4)  # New
+    prompt_debug = gr.Textbox(label="Full Prompt (Debug)", lines=8)
+    context_debug = gr.Textbox(label="Context Used (Debug)", lines=16)
+    raw_output = gr.Textbox(label="Raw Model Output (Debug)", lines=4)
     dbg = gr.Textbox(label="Debug", lines=4)
 
     load_btn.click(on_load, inputs=[rag_dir_in], outputs=status_box)
-    ask_btn.click(answer, inputs=[q, topk], outputs=[ans, src, prompt_debug, context_debug, raw_output, dbg])  # Updated outputs
+    
+    # Update to include audience parameter
+    ask_btn.click(
+        answer, 
+        inputs=[q, topk, audience_selector],  # <-- Added audience_selector
+        outputs=[ans, src, prompt_debug, context_debug, raw_output, dbg]
+    )
 
 if __name__ == "__main__":
     demo.launch(server_name="127.0.0.1", server_port=7861, show_error=True)
