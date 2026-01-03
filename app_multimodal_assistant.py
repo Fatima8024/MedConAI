@@ -6,97 +6,103 @@ import gradio as gr
 from core_classifier import run_classifier
 from core_rag import run_rag
 
-
 DISCLAIMER = (
     "⚠️ Educational use only. Not a medical device. "
     "Do NOT use this system for diagnosis or treatment decisions. "
-    "Always consult qualified clinicians for medical care."
+    "Always consult a qualified clinician."
 )
-
 
 def multimodal_pipeline(image, question, audience, top_k):
     """
-    Core logic for the assistant:
-    - Optionally run classifier on MRI image
-    - Build a combined question for RAG
-    - Run RAG with audience-aware instructions
-    - Return classifier + RAG outputs for the UI
+    Core logic:
+    - If image provided: run classifier (+ overlay), build an image_summary using cls_status
+    - Build a RAG question (image_summary + user question)
+    - Run RAG + LLM
     """
     # 1) Classifier (if image provided)
     cls_label = "no_image"
     cls_conf = 0.0
     cls_expl = "No MRI image provided, classifier not run."
     overlay = None
+    cls_status = "no_image"   # ✅ default, safe (no cls_result yet)
+
+    label_map = {
+    "glioma": "glioma",
+    "meningioma": "meningioma",
+    "pituitary": "pituitary tumour",
+    "no_tumor": "no tumour detected",
+    "no_tumour": "no tumour detected",
+    }
+    tumour_phrase = label_map.get(cls_label, cls_label)
+
 
     if image is not None:
+        try:
+         cls_result = run_classifier(image)
+        except Exception as e:
+            # ✅ prevent crash; show error in UI
+         cls_result = {
+            "adjusted_label": "unknown",
+            "confidence": 0.0,
+            "explanation": f"[Classifier ERROR] {type(e).__name__}: {e}",
+            "overlay": None,
+            "status": "error",
+        }
+ 
         cls_result = run_classifier(image)
         cls_label = cls_result.get("adjusted_label", "unknown")
         cls_conf = float(cls_result.get("confidence", 0.0) or 0.0)
         cls_expl = cls_result.get("explanation", "(no explanation)")
         overlay = cls_result.get("overlay", None)
 
-    # 2) Build combined question string for RAG
+        # ✅ NEW: status-aware summary control (defaults to "confident" if missing)
+        cls_status = cls_result.get("status", "confident")
+
+    # 2) Build question for RAG
     user_q = (question or "").strip()
 
+    # ---- TEXT-ONLY MODE ----
     if image is None:
-        # ---- TEXT-ONLY MODE: ignore classifier, just answer the question ----
         if user_q:
-            rag_question = (
-                "The user has asked a general question about brain tumors.\n\n"
-                f"Question: {user_q}\n\n"
-                "Using only the provided medical documents, please answer this question. "
-                "If the question has several parts, make sure you answer each part. "
-                "Do NOT give a diagnosis or a specific personal treatment decision; "
-                "encourage them to discuss options with their own doctors."
-            )
+            rag_question = f"Question: {user_q}"
         else:
-            rag_question = (
-                "Provide a general educational overview about brain tumors using the "
-                "provided medical documents only. Do not make any treatment decisions."
-            )
+            rag_question = "Provide a general overview of brain tumours."
 
+    # ---- IMAGE + CLASSIFIER MODE ----
     else:
-        # ---- IMAGE + CLASSIFIER MODE ----
-        if cls_label == "no_tumor":
+        # safe readable tumour phrase (handles low_confidence_/uncertain_ prefixes if they still appear)
+        tumour_phrase = (
+            cls_label.replace("low_confidence_", "")
+                    .replace("uncertain_", "")
+                    .replace("_", " ")
+        )
+
+        # ✅ NEW: status-aware image summary (your snippet)
+        if cls_status == "uncertain":
             image_summary = (
-                f"The computer model does not see a clear tumor in this slice "
-                f"(predicted class: 'no_tumor', confidence ~{cls_conf:.2f}). "
-                "This can be wrong; human radiologist review is essential."
+                f"MRI scan: classifier is uncertain (confidence {cls_conf:.2f}). "
+                f"Top possibilities are close; consider alternatives."
             )
+        elif cls_status == "low_confidence":
+            image_summary = (
+                f"MRI scan: classifier has low confidence (confidence {cls_conf:.2f}). "
+                f"Treat this as provisional."
+            )
+        elif cls_label in ("no_tumor", "no_tumour"):
+            image_summary = f"MRI scan: classifier detected no tumour (confidence {cls_conf:.2f})."
         else:
             image_summary = (
-                "The model highlights a region in red as suspicious. Its current best "
-                f"guess is that this lesion behaves like a **{cls_label}**-type tumor "
-                f"(confidence ~{cls_conf:.2f}). This is only a computer prediction, not a "
-                "confirmed diagnosis. Final diagnosis depends on full imaging and often "
-                "pathology."
+                f"MRI scan: classifier suggests {tumour_phrase} "
+                f"(confidence {cls_conf:.2f}). Not confirmed diagnosis."
             )
 
+        # Combine with user question (or default prompt)
         if user_q:
-            rag_question = (
-                f"{image_summary}\n\n"
-                f"The user question is:\n\"{user_q}\"\n\n"
-                "Using only the retrieved documents, please:\n"
-                "1) Briefly restate what the image + model suggest in general, making clear "
-                "that this is NOT a definitive diagnosis.\n"
-                "2) Then answer **all parts** of the question in order. If the question has "
-                "several sub-questions (for example: 'what type of tumor is this?', "
-                "'can the patient be cured?', 'what percentage of tumor is found?'), "
-                "respond to each of those parts explicitly.\n"
-                "3) For numerical details like 'what percentage of tumor is found', do NOT "
-                "invent numbers. If the information is not available from the documents, "
-                "say that this tool cannot reliably estimate exact percentages and that "
-                "radiologists and surgeons do these measurements.\n"
-                "4) Keep the discussion general and safe (no patient-specific treatment "
-                "prescriptions or drug doses).\n"
-            )
+            rag_question = f"{image_summary}\n\nQuestion: {user_q}"
         else:
             rag_question = (
                 f"{image_summary}\n\n"
-                "Using only the retrieved documents, explain in general terms what this "
-                "tumor category usually is, its typical imaging features, and common "
-                "management approaches. Do NOT make a patient-specific diagnosis or "
-                "treatment plan."
+                "Question: Explain what this could mean, where it occurs, symptoms, tests, and treatment options."
             )
 
     # 3) Run RAG + LLM
@@ -111,9 +117,11 @@ def multimodal_pipeline(image, question, audience, top_k):
     context_text = rag_result.get("context_text", "")
     dbg_text = rag_result.get("dbg", "")
 
+    # 4) Return to UI
     return (
         cls_label,
         f"{cls_conf:.3f}",
+        cls_status,
         cls_expl,
         overlay,
         answer,
@@ -123,89 +131,55 @@ def multimodal_pipeline(image, question, audience, top_k):
     )
 
 
-
 def build_app():
     with gr.Blocks(title="Brain Tumor Multimodal Assistant") as demo:
         gr.Markdown("# 🧠 Brain Tumor Multimodal Assistant")
         gr.Markdown(DISCLAIMER)
 
         with gr.Row():
-            # Left column: inputs
-            with gr.Column():
-                image_in = gr.Image(
-                    label="MRI slice (optional)",
-                    type="pil"
-                )
+            with gr.Column(scale=1):
+                image_in = gr.Image(label="MRI slice (optional)", type="pil")
                 question_in = gr.Textbox(
                     label="Question (optional)",
                     lines=4,
-                    placeholder="e.g. What does this kind of tumor usually mean?"
+                    placeholder="e.g. What does this kind of tumor usually mean? What are treatments?"
                 )
-                audience_in = gr.Radio(
+                audience_in = gr.Dropdown(
                     ["Patient", "Clinician"],
                     value="Patient",
-                    label="Audience"
+                    label="Audience mode"
                 )
                 topk_in = gr.Slider(
                     minimum=1,
-                    maximum=10,
+                    maximum=5,
                     value=5,
                     step=1,
-                    label="Top-K documents to retrieve"
+                    label="Top-K sources"
                 )
-                run_btn = gr.Button("Run Assistant", variant="primary")
+                run_btn = gr.Button("Run")
 
-            # Middle column: classifier outputs
-            with gr.Column():
-                gr.Markdown("## Imaging Classification (BRISC-based)")
-                cls_label_out = gr.Textbox(
-                    label="Predicted tumor category (adjusted)",
-                    interactive=False
-                )
-                cls_conf_out = gr.Textbox(
-                    label="Confidence (0–1, approximate)",
-                    interactive=False
-                )
-                overlay_out = gr.Image(
-                    label="Segmentation / ROI overlay (if available)"
-                )
-                cls_expl_out = gr.Textbox(
-                    label="Classifier explanation (rules, probabilities, notes)",
-                    lines=10,
-                    interactive=False
-                )
+            with gr.Column(scale=1):
+                cls_label_out = gr.Textbox(label="Classifier label", interactive=False)
+                cls_conf_out = gr.Textbox(label="Classifier confidence", interactive=False)
+                cls_status_out = gr.Textbox(label="Classifier status", interactive=False)
+                cls_expl_out = gr.Textbox(label="Classifier explanation", lines=10, interactive=False)
+                overlay_out = gr.Image(label="Segmentation overlay (if available)")
 
-            # Right column: RAG answer + traceability
-            with gr.Column():
-                gr.Markdown("## Document-grounded Answer")
-                answer_out = gr.Textbox(
-                    label="Answer",
-                    lines=10,
-                    interactive=False
-                )
-                sources_out = gr.Textbox(
-                    label="Sources (guidelines, textbooks, papers)",
-                    lines=6,
-                    interactive=False
-                )
-                context_out = gr.Textbox(
-                    label="Context used (debug / traceability)",
-                    lines=8,
-                    interactive=False
-                )
-                dbg_out = gr.Textbox(
-                    label="RAG debug / errors",
-                    lines=4,
-                    interactive=False
-            )
+        with gr.Row():
+            answer_out = gr.Textbox(label="Answer", lines=8, interactive=False)
+        with gr.Row():
+            sources_out = gr.Textbox(label="Sources", lines=6, interactive=False)
+            context_out = gr.Textbox(label="Context Used (Debug)", lines=10, interactive=False)
+        with gr.Row():
+            dbg_out = gr.Textbox(label="Debug", lines=3, interactive=False)
 
-        # Wire button
         run_btn.click(
             fn=multimodal_pipeline,
             inputs=[image_in, question_in, audience_in, topk_in],
             outputs=[
                 cls_label_out,
                 cls_conf_out,
+                cls_status_out,
                 cls_expl_out,
                 overlay_out,
                 answer_out,
